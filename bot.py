@@ -20,6 +20,7 @@ MENTION_CHUNK_LIMIT = 1_850
 NOTICE_CONTENT_LIMIT = 1_800
 # Discord 임베드 필드 값은 최대 1,024자입니다.
 NOTICE_RESULT_LIMIT = 900
+NOTICE_RETRY_COUNT = 5
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,15 @@ def database() -> sqlite3.Connection:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS notice_exemptions (
+            guild_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (guild_id, user_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_administrators (
             guild_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
             PRIMARY KEY (guild_id, user_id)
@@ -100,9 +110,64 @@ def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
             )
 
 
+def is_bot_administrator(guild_id: int, user_id: int) -> bool:
+    with database() as connection:
+        row = connection.execute(
+            "SELECT 1 FROM bot_administrators WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        ).fetchone()
+    return row is not None
+
+
+def set_bot_administrator(guild_id: int, user_id: int, is_administrator: bool) -> None:
+    with database() as connection:
+        if is_administrator:
+            connection.execute(
+                "INSERT OR IGNORE INTO bot_administrators (guild_id, user_id) VALUES (?, ?)",
+                (guild_id, user_id),
+            )
+        else:
+            connection.execute(
+                "DELETE FROM bot_administrators WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+
+
+def get_bot_administrator_ids(guild_id: int) -> list[int]:
+    with database() as connection:
+        rows = connection.execute(
+            "SELECT user_id FROM bot_administrators WHERE guild_id = ? ORDER BY user_id",
+            (guild_id,),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def can_manage(interaction: discord.Interaction) -> bool:
     member = interaction.user
     return isinstance(member, discord.Member) and member.guild_permissions.manage_guild
+
+
+def can_use_notice_admin(interaction: discord.Interaction) -> bool:
+    """봇 소유자, 서버 소유자 또는 지정된 공지 관리자만 공지 기능을 사용합니다."""
+    return (
+        interaction.guild is not None
+        and (
+            interaction.user.id == bot.application_owner_id
+            or interaction.user.id == interaction.guild.owner_id
+            or is_bot_administrator(interaction.guild.id, interaction.user.id)
+        )
+    )
+
+
+def is_owner(interaction: discord.Interaction) -> bool:
+    """봇 애플리케이션 소유자와 현재 서버 소유자를 모두 소유주로 취급합니다."""
+    return (
+        interaction.guild is not None
+        and (
+            interaction.user.id == bot.application_owner_id
+            or interaction.user.id == interaction.guild.owner_id
+        )
+    )
 
 
 async def fetch_target_message(bot: discord.Client, target: CheckTarget) -> discord.Message:
@@ -175,6 +240,30 @@ def make_mention_pages(members: list[discord.Member]) -> list[str]:
     if mentions:
         pages.append(" ".join(mentions))
     return pages
+
+
+async def send_direct_notice(member: discord.Member, notice: str) -> bool:
+    """DM 차단은 즉시 포기하고, 제한·일시 오류만 제한적으로 재시도합니다."""
+    for attempt in range(NOTICE_RETRY_COUNT):
+        try:
+            await member.send(
+                notice,
+                # 공지 내용에 들어 있는 @everyone, 역할, 다른 사용자 멘션은 알리지 않습니다.
+                allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+            )
+            return True
+        except (discord.Forbidden, discord.NotFound):
+            # 사용자가 서버 DM을 차단했거나 탈퇴한 경우: 즉시 실패 처리합니다.
+            return False
+        except discord.HTTPException as error:
+            status = getattr(error, "status", None)
+            # discord.py는 대부분의 429 제한을 내부에서 기다린 뒤 처리합니다.
+            # 그래도 제한(429) 또는 Discord의 일시 서버 오류(5xx)가 전달되면 재시도합니다.
+            should_retry = status == 429 or (isinstance(status, int) and status >= 500)
+            if not should_retry or attempt == NOTICE_RETRY_COUNT - 1:
+                return False
+            await asyncio.sleep(2 ** attempt)
+    return False
 
 
 class ResultView(discord.ui.View):
@@ -275,13 +364,17 @@ class AttendanceBot(discord.Client):
         intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.application_owner_id: int | None = None
 
     async def setup_hook(self) -> None:
+        app_info = await self.application_info()
+        self.application_owner_id = app_info.owner.id
         await self.tree.sync()
 
 
 bot = AttendanceBot()
 group = app_commands.Group(name="미반응자", description="반응하지 않은 일반 유저를 확인합니다.")
+admin_group = app_commands.Group(name="관리자", description="공지용 봇 관리자 권한을 관리합니다.")
 
 
 @bot.tree.command(name="인원체크", description="현재 채널의 메시지를 반응 확인 대상으로 등록합니다.")
@@ -323,7 +416,7 @@ async def check_non_responders(interaction: discord.Interaction) -> None:
     if target is None:
         await interaction.response.send_message("먼저 `/인원체크`로 대상 메시지를 등록해 주세요.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
+    await interaction.response.defer()
     try:
         message, members, total_members = await get_non_responders(bot, interaction.guild, target)
     except discord.NotFound:
@@ -336,7 +429,7 @@ async def check_non_responders(interaction: discord.Interaction) -> None:
         await interaction.followup.send(f"조회 중 오류가 발생했습니다: {error}", ephemeral=True)
         return
     view = ResultView(bot, interaction.user.id, interaction.guild, target, members, total_members, message)
-    await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
 @bot.tree.command(name="공지", description="서버 일반 유저에게 공지 내용을 DM으로 보냅니다.")
@@ -345,8 +438,8 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not can_manage(interaction):
-        await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("공지 봇 관리자 권한이 필요합니다.", ephemeral=True)
         return
     if len(내용) > NOTICE_CONTENT_LIMIT:
         await interaction.response.send_message(
@@ -370,20 +463,12 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
             continue
         total_members += 1
         notice = f"# [외지주 공지]\n\n{내용}\n\n-# 공지 DM입니다 {member.mention}"
-        try:
-            await member.send(
-                notice,
-                # 공지 내용에 들어 있는 @everyone, 역할, 다른 사용자 멘션은 알리지 않습니다.
-                allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
-            )
+        if await send_direct_notice(member, notice):
             sent_count += 1
-        except (discord.Forbidden, discord.NotFound):
-            # 사용자가 서버 DM을 차단했거나 탈퇴한 경우입니다.
+        else:
             failed_members.append(member)
-        except discord.HTTPException:
-            failed_members.append(member)
-        # 대량 DM이므로 Discord의 전송 제한에 맞춰 천천히 보냅니다.
-        await asyncio.sleep(0.7)
+        # 짧은 간격만 두고, Discord의 실제 제한은 라이브러리가 처리합니다.
+        await asyncio.sleep(0.1)
 
     failed_count = len(failed_members)
     mention_pages = make_mention_pages(failed_members)
@@ -420,8 +505,8 @@ async def set_notice_exempt_member(
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not can_manage(interaction):
-        await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("공지 봇 관리자 권한이 필요합니다.", ephemeral=True)
         return
     if 유저.bot:
         await interaction.response.send_message("봇 계정은 공지 대상이 아니므로 설정할 수 없습니다.", ephemeral=True)
@@ -437,7 +522,77 @@ async def set_notice_exempt_member(
     )
 
 
+@admin_group.command(name="부여", description="유저에게 공지용 봇 관리자 권한을 부여합니다.")
+@app_commands.describe(유저="공지 봇 관리자로 지정할 유저")
+async def grant_bot_administrator(interaction: discord.Interaction, 유저: discord.Member) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 권한을 부여할 수 있습니다.", ephemeral=True)
+        return
+    if 유저.bot:
+        await interaction.response.send_message("봇 계정에는 권한을 부여할 수 없습니다.", ephemeral=True)
+        return
+    set_bot_administrator(interaction.guild.id, 유저.id, True)
+    await interaction.response.send_message(
+        f"{discord.utils.escape_mentions(유저.display_name)}님에게 공지 봇 관리자 권한을 부여했습니다.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@admin_group.command(name="해제", description="유저의 공지용 봇 관리자 권한을 해제합니다.")
+@app_commands.describe(유저="공지 봇 관리자 권한을 해제할 유저")
+async def revoke_bot_administrator(interaction: discord.Interaction, 유저: discord.Member) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 권한을 해제할 수 있습니다.", ephemeral=True)
+        return
+    set_bot_administrator(interaction.guild.id, 유저.id, False)
+    await interaction.response.send_message(
+        f"{discord.utils.escape_mentions(유저.display_name)}님의 공지 봇 관리자 권한을 해제했습니다.",
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
+@admin_group.command(name="목록", description="공지용 봇 관리자 목록을 확인합니다.")
+async def list_bot_administrators(interaction: discord.Interaction) -> None:
+    if interaction.guild is None:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 목록을 확인할 수 있습니다.", ephemeral=True)
+        return
+
+    entries = [
+        f"• 봇 소유자 (`{bot.application_owner_id}`)",
+        f"• 서버 소유자 (`{interaction.guild.owner_id}`)",
+    ]
+    for user_id in get_bot_administrator_ids(interaction.guild.id):
+        member = interaction.guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await interaction.guild.fetch_member(user_id)
+            except discord.HTTPException:
+                entries.append(f"• 알 수 없는 사용자 (`{user_id}`)")
+                continue
+        entries.append(f"• {safe_name(member)} (`{user_id}`)")
+
+    embed = discord.Embed(title="공지 봇 관리자 목록", description="\n".join(entries), colour=discord.Colour.blurple())
+    embed.set_footer(text="봇 소유자와 서버 소유자는 항상 공지 관리 권한을 가집니다.")
+    await interaction.response.send_message(
+        embed=embed,
+        ephemeral=True,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+
+
 bot.tree.add_command(group)
+bot.tree.add_command(admin_group)
 
 
 if __name__ == "__main__":
@@ -445,3 +600,4 @@ if __name__ == "__main__":
     if not token or token == "붙여넣을_봇_토큰":
         raise RuntimeError(f"{ENVIRONMENT_PATH} 파일에 DISCORD_TOKEN을 설정해 주세요.")
     bot.run(token)
+
