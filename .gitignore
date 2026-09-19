@@ -1,0 +1,7 @@
+# 비밀값과 로컬 실행 파일은 GitHub에 올리지 않습니다.
+.env
+.venv/
+__pycache__/
+*.py[cod]
+attendance.sqlite3
+
