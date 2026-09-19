@@ -675,23 +675,33 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
             await interaction.response.send_message("등록된 공지방을 찾을 수 없습니다. 다시 등록해 주세요.", ephemeral=True)
             return
 
-        embed = discord.Embed(
-            title=f"📢 {self.time.value} 회의",
-            description=f"**필참입니다**\n\n{discord.utils.escape_mentions(self.content.value)}",
-            colour=discord.Colour.blurple(),
-        )
-        embed.set_footer(text="불참해야 한다면 아래 버튼으로 사유를 신청해 주세요.")
         try:
             await notice_channel.send(
-                "@everyone",
-                embed=embed,
-                view=AbsenceApplyView(),
+                view=MeetingAnnouncementView(self.time.value, self.content.value),
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=True),
             )
         except discord.Forbidden:
             await interaction.response.send_message("공지방에 메시지를 보내거나 @everyone을 멘션할 권한이 없습니다.", ephemeral=True)
             return
         await interaction.response.send_message(f"회의 공지를 {notice_channel.mention}에 올렸습니다.", ephemeral=True)
+
+
+class MeetingApplyRow(discord.ui.ActionRow):
+    @discord.ui.button(label="불참사유신청", style=discord.ButtonStyle.secondary,
+                       custom_id="meeting_absence_apply_box")
+    async def apply(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.send_modal(AbsenceReasonModal())
+
+
+class MeetingAnnouncementView(discord.ui.LayoutView):
+    def __init__(self, time: str = "회의 시간", content: str = "회의 내용") -> None:
+        super().__init__(timeout=None)
+        heading = discord.utils.escape_mentions(time).replace("\n", " ").replace("\r", " ")
+        self.add_item(discord.ui.TextDisplay("|| @everyone ||"))
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(f"# {heading} 시작\n\n{discord.utils.escape_mentions(content)}"),
+            MeetingApplyRow(),
+        ))
 
 
 class AbsenceApplyView(discord.ui.View):
@@ -756,6 +766,7 @@ class AttendanceBot(discord.Client):
         app_info = await self.application_info()
         self.application_owner_id = app_info.owner.id
         self.add_view(AbsenceApplyView())
+        self.add_view(MeetingAnnouncementView())
         for request_id, message_id in get_pending_request_message_ids():
             self.add_view(AbsenceDecisionView(request_id), message_id=message_id)
         await self.tree.sync()
@@ -840,8 +851,8 @@ def make_absence_pages(absences: list[tuple[int, str]]) -> list[str]:
     pages: list[str] = []
     lines: list[str] = []
     size = 0
-    for user_id, reason in absences:
-        line = f"• <@{user_id}> (`{user_id}`) — {discord.utils.escape_mentions(reason)}"
+    for user_id, _ in absences:
+        line = f"• <@{user_id}> (`{user_id}`)"
         if lines and size + len(line) + 1 > EMBED_LIMIT:
             pages.append("\n".join(lines))
             lines, size = [], 0
