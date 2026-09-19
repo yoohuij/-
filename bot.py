@@ -105,7 +105,33 @@ def database() -> sqlite3.Connection:
         )
         """
     )
+    connection.execute(
+        "CREATE TABLE IF NOT EXISTS meeting_status ("
+        "guild_id INTEGER PRIMARY KEY, phase TEXT NOT NULL, end_message_id INTEGER)"
+    )
     return connection
+
+
+def meeting_phase(guild_id: int) -> str:
+    with database() as connection:
+        row = connection.execute("SELECT phase FROM meeting_status WHERE guild_id = ?", (guild_id,)).fetchone()
+    return row[0] if row else "collecting"
+
+
+def set_meeting_phase(guild_id: int, phase: str, end_message_id: int | None = None) -> None:
+    with database() as connection:
+        connection.execute(
+            "INSERT INTO meeting_status VALUES (?, ?, ?) ON CONFLICT(guild_id) DO UPDATE SET "
+            "phase = excluded.phase, end_message_id = excluded.end_message_id",
+            (guild_id, phase, end_message_id),
+        )
+
+
+async def open_absence_modal(interaction: discord.Interaction) -> None:
+    if interaction.guild is None or meeting_phase(interaction.guild.id) != "collecting":
+        await interaction.response.send_message("불참 사유 신청이 마감되었습니다.", ephemeral=True)
+        return
+    await interaction.response.send_modal(AbsenceReasonModal())
 
 
 def save_target(target: CheckTarget) -> None:
@@ -647,6 +673,9 @@ class AbsenceReasonModal(discord.ui.Modal, title="불참 사유 신청"):
             return
 
         reason = self.reason.value
+        if meeting_phase(interaction.guild.id) != "collecting":
+            await interaction.response.send_message("불참 사유 신청이 마감되었습니다.", ephemeral=True)
+            return
         request_id = create_absence_request(interaction.guild.id, interaction.user.id, reason)
         embed = discord.Embed(title="불참 사유 신청", colour=discord.Colour.gold())
         embed.add_field(name="신청자", value=f"{interaction.user.mention} (`{interaction.user.id}`)", inline=False)
@@ -705,6 +734,8 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
         except discord.Forbidden:
             await interaction.response.send_message("공지방에 메시지를 보내거나 @everyone을 멘션할 권한이 없습니다.", ephemeral=True)
             return
+        if meeting_phase(interaction.guild.id) != "active":
+            set_meeting_phase(interaction.guild.id, "collecting")
         await interaction.response.send_message(f"회의 공지를 {notice_channel.mention}에 올렸습니다.", ephemeral=True)
 
 
@@ -712,7 +743,7 @@ class MeetingApplyRow(discord.ui.ActionRow):
     @discord.ui.button(label="불참사유신청", style=discord.ButtonStyle.secondary,
                        custom_id="meeting_absence_apply_box")
     async def apply(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AbsenceReasonModal())
+        await open_absence_modal(interaction)
 
 
 class MeetingAnnouncementView(discord.ui.LayoutView):
@@ -732,7 +763,7 @@ class AbsenceApplyView(discord.ui.View):
 
     @discord.ui.button(label="불참 사유 신청", style=discord.ButtonStyle.secondary, custom_id="meeting_absence_apply")
     async def apply(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        await interaction.response.send_modal(AbsenceReasonModal())
+        await open_absence_modal(interaction)
 
 
 class AbsenceDecisionButton(discord.ui.Button):
@@ -788,6 +819,7 @@ class AttendanceBot(discord.Client):
         app_info = await self.application_info()
         self.application_owner_id = app_info.owner.id
         self.add_view(AbsenceApplyView())
+        self.add_view(MeetingEndView())
         self.add_view(MeetingAnnouncementView())
         for request_id, message_id in get_pending_request_message_ids():
             self.add_view(AbsenceDecisionView(request_id), message_id=message_id)
@@ -805,6 +837,8 @@ async def on_voice_state_update(
 ) -> None:
     """등록된 회의방의 입장·퇴장을 등록된 로그방으로 기록합니다."""
     if member.bot or member.guild is None:
+        return
+    if meeting_phase(member.guild.id) != "active":
         return
     settings = get_meeting_settings(member.guild.id)
     if settings.meeting_channel_id is None or settings.log_channel_id is None:
@@ -1274,28 +1308,91 @@ async def list_bot_administrators(interaction: discord.Interaction) -> None:
     )
 
 
-reason_group = app_commands.Group(name="사유", description="불참 사유와 명단을 관리합니다.")
+class MeetingEndView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
 
-
-@reason_group.command(name="초기화", description="이 서버의 불참자 명단과 저장된 사유 및 신청을 초기화합니다.")
-@app_commands.guild_only()
-async def reset_absences(interaction: discord.Interaction) -> None:
-    if not is_owner(interaction):
-        await interaction.response.send_message(
-            "봇 소유자 또는 서버 소유자만 사유를 초기화할 수 있습니다.", ephemeral=True
+    @discord.ui.button(label="사유 초기화", style=discord.ButtonStyle.danger, custom_id="meeting_end_reset")
+    async def reset(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not is_owner(interaction):
+            await interaction.response.send_message("봇 소유자 또는 서버 소유자만 초기화할 수 있습니다.", ephemeral=True)
+            return
+        with database() as connection:
+            row = connection.execute(
+                "SELECT phase, end_message_id FROM meeting_status WHERE guild_id = ?",
+                (interaction.guild.id,),
+            ).fetchone()
+        if not row or row != ("ended", interaction.message.id):
+            await interaction.response.send_message("현재 회의의 종료 메시지에서만 초기화할 수 있습니다.", ephemeral=True)
+            return
+        counts = reset_absence_data(interaction.guild.id)
+        set_meeting_phase(interaction.guild.id, "cleared")
+        self.reset.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"불참자 {counts[0]}명과 사유 신청 {counts[1]}건을 초기화했습니다. 사유방의 기존 메시지는 남습니다.",
+            ephemeral=True,
         )
+
+
+meeting_group = app_commands.Group(name="회의", description="회의 시작과 종료를 관리합니다.")
+
+
+async def change_meeting_state(interaction: discord.Interaction, starting: bool) -> None:
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    guild_id = interaction.guild.id
+    phase = meeting_phase(guild_id)
+    if (starting and phase == "active") or (not starting and phase != "active"):
+        await interaction.response.send_message("이미 회의 중입니다." if starting else "진행 중인 회의가 없습니다.", ephemeral=True)
+        return
+    settings = get_meeting_settings(guild_id)
+    if starting and (settings.meeting_channel_id is None or settings.log_channel_id is None):
+        await interaction.response.send_message("먼저 회의방과 로그방을 등록해 주세요.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    approved_count, request_count = reset_absence_data(interaction.guild.id)
+    channel = bot.get_channel(settings.notice_channel_id) if settings.notice_channel_id else None
+    try:
+        if channel is None and settings.notice_channel_id:
+            channel = await bot.fetch_channel(settings.notice_channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            await interaction.followup.send("공지방을 먼저 등록해 주세요.", ephemeral=True)
+            return
+        # 송신 중에도 시작/종료 상태가 적용되며, 실패하면 이전 상태로 복구합니다.
+        set_meeting_phase(guild_id, "active" if starting else "ended")
+        message = await channel.send(
+            content="|| @everyone ||\n# 회의가 시작되었습니다" if starting else "회의가 종료되었습니다",
+            embed=discord.Embed(description="신속히 참여해주세요", colour=discord.Colour.blurple()) if starting else None,
+            view=None if starting else MeetingEndView(),
+            allowed_mentions=discord.AllowedMentions(everyone=starting, users=False, roles=False),
+        )
+    except discord.HTTPException:
+        set_meeting_phase(guild_id, phase)
+        await interaction.followup.send("안내를 전송하지 못했습니다. 공지방 권한을 확인해 주세요.", ephemeral=True)
+        return
+    if not starting:
+        set_meeting_phase(guild_id, "ended", message.id)
     await interaction.followup.send(
-        f"불참자 {approved_count}명의 명단과 사유, 신청 자료 {request_count}건을 초기화했습니다.\n"
-        "이전 신청의 수락·거절 버튼은 더 이상 처리되지 않습니다.\n"
-        "사유방에 이미 게시된 메시지는 그대로 남습니다.",
+        "회의를 시작했습니다. 입퇴장 로그를 켜고 사유 신청을 마감했습니다." if starting
+        else "회의를 종료하고 입퇴장 로그를 껐습니다. 종료 안내의 버튼으로 사유를 초기화할 수 있습니다.",
         ephemeral=True,
     )
 
 
-bot.tree.add_command(reason_group)
+@meeting_group.command(name="시작", description="회의를 시작하고 사유 신청을 마감하며 입퇴장 로그를 켭니다.")
+@app_commands.guild_only()
+async def start_meeting(interaction: discord.Interaction) -> None:
+    await change_meeting_state(interaction, True)
+
+
+@meeting_group.command(name="종료", description="회의를 종료하고 사유 초기화 버튼을 표시합니다.")
+@app_commands.guild_only()
+async def end_meeting(interaction: discord.Interaction) -> None:
+    await change_meeting_state(interaction, False)
+
+
+bot.tree.add_command(meeting_group)
 bot.tree.add_command(group)
 bot.tree.add_command(admin_group)
 
