@@ -233,6 +233,18 @@ def get_approved_absences(guild_id: int) -> list[tuple[int, str]]:
     return [(int(user_id), str(reason)) for user_id, reason in rows]
 
 
+def reset_absence_data(guild_id: int) -> tuple[int, int]:
+    """해당 서버의 승인 명단과 신청 자료를 한 트랜잭션으로 초기화합니다."""
+    with database() as connection:
+        approved_count = connection.execute(
+            "DELETE FROM approved_absences WHERE guild_id = ?", (guild_id,)
+        ).rowcount
+        request_count = connection.execute(
+            "DELETE FROM absence_requests WHERE guild_id = ?", (guild_id,)
+        ).rowcount
+    return approved_count, request_count
+
+
 def get_pending_request_message_ids() -> list[tuple[int, int]]:
     with database() as connection:
         rows = connection.execute(
@@ -1262,6 +1274,28 @@ async def list_bot_administrators(interaction: discord.Interaction) -> None:
     )
 
 
+reason_group = app_commands.Group(name="사유", description="불참 사유와 명단을 관리합니다.")
+
+
+@reason_group.command(name="초기화", description="이 서버의 불참자 명단과 저장된 사유 및 신청을 초기화합니다.")
+@app_commands.guild_only()
+async def reset_absences(interaction: discord.Interaction) -> None:
+    if not is_owner(interaction):
+        await interaction.response.send_message(
+            "봇 소유자 또는 서버 소유자만 사유를 초기화할 수 있습니다.", ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    approved_count, request_count = reset_absence_data(interaction.guild.id)
+    await interaction.followup.send(
+        f"불참자 {approved_count}명의 명단과 사유, 신청 자료 {request_count}건을 초기화했습니다.\n"
+        "이전 신청의 수락·거절 버튼은 더 이상 처리되지 않습니다.\n"
+        "사유방에 이미 게시된 메시지는 그대로 남습니다.",
+        ephemeral=True,
+    )
+
+
+bot.tree.add_command(reason_group)
 bot.tree.add_command(group)
 bot.tree.add_command(admin_group)
 
