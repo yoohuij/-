@@ -680,10 +680,12 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
                 content="|| @everyone ||\n# 회의 공지",
                 embed=discord.Embed(
                     description=(
-                        f"회의시간 : {discord.utils.escape_mentions(self.time.value)}\n\n"
+                        f"## 회의시간 : {discord.utils.escape_mentions(self.time.value)}\n\n"
                         f"{discord.utils.escape_mentions(self.content.value)}"
                     ),
                     colour=discord.Colour.blurple(),
+                ).set_footer(
+                    text="사정으로 불참시 불참 사유 신청을 통해 사유 신청해주십시오."
                 ),
                 view=AbsenceApplyView(),
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=True),
