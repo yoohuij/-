@@ -677,7 +677,15 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
 
         try:
             await notice_channel.send(
-                view=MeetingAnnouncementView(self.time.value, self.content.value),
+                content="# 회의 공지\n|| @everyone ||",
+                embed=discord.Embed(
+                    description=(
+                        f"회의시간 : {discord.utils.escape_mentions(self.time.value)}\n\n"
+                        f"{discord.utils.escape_mentions(self.content.value)}"
+                    ),
+                    colour=discord.Colour.blurple(),
+                ),
+                view=AbsenceApplyView(),
                 allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=True),
             )
         except discord.Forbidden:
