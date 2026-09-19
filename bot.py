@@ -677,7 +677,7 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
 
         try:
             await notice_channel.send(
-                content="# 회의 공지\n|| @everyone ||",
+                content="|| @everyone ||\n# 회의 공지",
                 embed=discord.Embed(
                     description=(
                         f"회의시간 : {discord.utils.escape_mentions(self.time.value)}\n\n"
