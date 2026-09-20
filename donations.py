@@ -1,5 +1,6 @@
 """Global donation ledger with per-server announcement and ranking configuration."""
 import asyncio
+import io
 import re
 from contextlib import contextmanager
 
@@ -19,13 +20,14 @@ def render(template: str, user_id: int, money: int, rank: int | None = None) -> 
 RANK_PREFIXES = ('1st', '2nd', '3rd')
 
 
-def render_ranking(template: str, totals) -> str:
-    if any('{' + prefix + field + '}' in template for prefix in RANK_PREFIXES for field in ('user', 'money')):
+def render_ranking(template: str, totals, extra_text=None) -> str:
+    if '{exuser}' in template or any('{' + prefix + field + '}' in template for prefix in RANK_PREFIXES for field in ('user', 'money')):
         result = discord.utils.escape_mentions(template)
         for index, prefix in enumerate(RANK_PREFIXES):
             user, money = (f'<@{totals[index][0]}>', str(totals[index][1])) if index < len(totals) else ('없음', '0')
             result = result.replace('{' + prefix + 'user}', user).replace('{' + prefix + 'money}', money)
-        return result
+        extras = ', '.join(f'<@{uid}>' for uid, _ in totals[3:]) or '없음'
+        return result.replace('{exuser}', extras if extra_text is None else extra_text)
     # Previously saved per-rank templates continue working until replaced.
     return '\n\n'.join(render(template, uid, amount, rank) for rank, (uid, amount) in enumerate(totals[:3], 1)) or '아직 후원 기록이 없습니다.'
 
@@ -160,17 +162,27 @@ class DonationFeature:
         template = config['ranking_template']
         if not template:
             raise ValueError('먼저 `/후원랭킹메시지`로 양식을 등록해 주세요.')
-        content = render_ranking(template, self.store.totals()[:3])
+        totals = self.store.totals()
+        content = render_ranking(template, totals)
+        attachments = []
+        if len(content) > 2000 and '{exuser}' in template:
+            # Keep the existing ranking message and include every remaining donor.
+            lines = []
+            for rank, (uid, _) in enumerate(totals[3:], 4):
+                user = self.bot.get_user(uid)
+                lines.append(f'{rank}. {user} (ID: {uid})' if user else f'{rank}. User ID: {uid}')
+            attachments = [discord.File(io.BytesIO('\n'.join(lines).encode('utf-8-sig')), filename='other-donors.txt')]
+            content = render_ranking(template, totals, '전체 명단은 첨부된 other-donors.txt 파일을 확인해 주세요.')
         if len(content) > 2000:
             raise ValueError('랭킹 양식이 너무 깁니다. 더 짧게 등록해 주세요.')
         if config['ranking_message']:
             try:
                 message = await channel.fetch_message(config['ranking_message'])
-                await message.edit(content=content, allowed_mentions=discord.AllowedMentions.none())
+                await message.edit(content=content, attachments=attachments, allowed_mentions=discord.AllowedMentions.none())
                 return
             except discord.NotFound:
                 pass
-        message = await channel.send(content, allowed_mentions=discord.AllowedMentions.none())
+        message = await channel.send(content, files=attachments, allowed_mentions=discord.AllowedMentions.none())
         self.store.configure(guild_id, ranking_message=message.id)
 
 
@@ -179,7 +191,7 @@ class DonationTemplateModal(discord.ui.Modal):
         super().__init__(title='후원 랭킹 양식 등록' if ranking else '후원 기록 공지 등록')
         self.feature, self.ranking = feature, ranking
         self.body = discord.ui.TextInput(label='출력 양식', style=discord.TextStyle.paragraph,
-            placeholder='1~3위 태그로 자유롭게 작성: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney}' if ranking else '🎉 {user}님 {money}원 후원 감사합니다 🎉',
+            placeholder='1~3위: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney} / 나머지 후원자: {exuser}' if ranking else '🎉 {user}님 {money}원 후원 감사합니다 🎉',
             max_length=1500)
         self.add_item(self.body)
 
