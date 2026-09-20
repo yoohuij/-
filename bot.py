@@ -1224,8 +1224,29 @@ async def check_non_responders(interaction: discord.Interaction) -> None:
     await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="공지", description="서버 일반 유저에게 공지 내용을 DM으로 보냅니다.")
-@app_commands.describe(내용="DM으로 보낼 공지 내용")
+class NoticeModal(discord.ui.Modal, title="공지 작성"):
+    content = discord.ui.TextInput(
+        label="내용", style=discord.TextStyle.paragraph,
+        placeholder="DM으로 보낼 공지 내용을 입력해 주세요.",
+        required=True, max_length=NOTICE_CONTENT_LIMIT,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not self.content.value.strip():
+            await interaction.response.send_message("공지 내용을 입력해 주세요.", ephemeral=True)
+            return
+        await send_notice(interaction, self.content.value)
+
+
+@bot.tree.command(name="공지", description="내용 입력창을 열어 공지 DM을 작성합니다.")
+@app_commands.guild_only()
+async def open_notice(interaction: discord.Interaction) -> None:
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("공지 봇 관리자 권한이 필요합니다.", ephemeral=True)
+        return
+    await interaction.response.send_modal(NoticeModal())
+
+
 async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
