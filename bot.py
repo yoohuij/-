@@ -405,8 +405,8 @@ def make_pages(members: list[discord.Member]) -> list[str]:
     lines: list[str] = []
     size = 0
     for member in members:
-        line = f"• {safe_name(member)} (`{member.name}` · `{member.id}`)"
-        if lines and size + len(line) + 1 > EMBED_LIMIT:
+        line = f"• {safe_name(member)} (`{member.name}`)"
+        if lines and (len(lines) >= 20 or size + len(line) + 1 > EMBED_LIMIT):
             pages.append("\n".join(lines))
             lines, size = [], 0
         lines.append(line)
@@ -560,8 +560,8 @@ def make_member_pages(members: list[discord.Member], empty_message: str) -> list
     lines: list[str] = []
     size = 0
     for member in members:
-        line = f"• {safe_name(member)} (`{member.name}` · `{member.id}`)"
-        if lines and size + len(line) + 1 > EMBED_LIMIT:
+        line = f"• {safe_name(member)} (`{member.name}`)"
+        if lines and (len(lines) >= 20 or size + len(line) + 1 > EMBED_LIMIT):
             pages.append("\n".join(lines))
             lines, size = [], 0
         lines.append(line)
