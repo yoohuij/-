@@ -1179,7 +1179,7 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
             exempt_count += 1
             continue
         total_members += 1
-        notice = f"# [외지주 공지]\n\n{내용}\n\n-# 공지 DM입니다 {member.mention}"
+        notice = f"# [정점 공지]\n\n{내용}\n\n-# 공지 DM입니다 {member.mention}"
         if await send_direct_notice(member, notice):
             sent_count += 1
         else:
