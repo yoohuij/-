@@ -114,6 +114,10 @@ def database() -> sqlite3.Connection:
     if connection.execute("SELECT 1 FROM schema_migrations WHERE name = 'global_exemptions'").fetchone() is None:
         connection.execute("INSERT OR IGNORE INTO global_exemptions SELECT DISTINCT user_id FROM notice_exemptions")
         connection.execute("INSERT INTO schema_migrations VALUES ('global_exemptions')")
+    connection.execute("CREATE TABLE IF NOT EXISTS global_administrators (user_id INTEGER PRIMARY KEY)")
+    if connection.execute("SELECT 1 FROM schema_migrations WHERE name = 'global_administrators'").fetchone() is None:
+        connection.execute("INSERT OR IGNORE INTO global_administrators SELECT DISTINCT user_id FROM bot_administrators")
+        connection.execute("INSERT INTO schema_migrations VALUES ('global_administrators')")
     connection.commit()
     connection.execute("CREATE TABLE IF NOT EXISTS warning_settings (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)")
     connection.execute("CREATE TABLE IF NOT EXISTS warning_snapshots (guild_id INTEGER, message_id INTEGER, user_id INTEGER, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,message_id,user_id))")
@@ -335,8 +339,8 @@ def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool)
 def is_bot_administrator(guild_id: int, user_id: int) -> bool:
     with database() as connection:
         row = connection.execute(
-            "SELECT 1 FROM bot_administrators WHERE guild_id = ? AND user_id = ?",
-            (guild_id, user_id),
+            "SELECT 1 FROM global_administrators WHERE user_id = ?",
+            (user_id,),
         ).fetchone()
     return row is not None
 
@@ -345,21 +349,20 @@ def set_bot_administrator(guild_id: int, user_id: int, is_administrator: bool) -
     with database() as connection:
         if is_administrator:
             connection.execute(
-                "INSERT OR IGNORE INTO bot_administrators (guild_id, user_id) VALUES (?, ?)",
-                (guild_id, user_id),
+                "INSERT OR IGNORE INTO global_administrators (user_id) VALUES (?)",
+                (user_id,),
             )
         else:
             connection.execute(
-                "DELETE FROM bot_administrators WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "DELETE FROM global_administrators WHERE user_id = ?",
+                (user_id,),
             )
 
 
 def get_bot_administrator_ids(guild_id: int) -> list[int]:
     with database() as connection:
         rows = connection.execute(
-            "SELECT user_id FROM bot_administrators WHERE guild_id = ? ORDER BY user_id",
-            (guild_id,),
+            "SELECT user_id FROM global_administrators ORDER BY user_id",
         ).fetchall()
     return [row[0] for row in rows]
 
@@ -1322,19 +1325,19 @@ async def list_global_exceptions(interaction: discord.Interaction) -> None:
 
 @admin_group.command(name="부여", description="유저에게 공지용 봇 관리자 권한을 부여합니다.")
 @app_commands.describe(유저="공지 봇 관리자로 지정할 유저")
-async def grant_bot_administrator(interaction: discord.Interaction, 유저: discord.Member) -> None:
+async def grant_bot_administrator(interaction: discord.Interaction, 유저: discord.User) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 권한을 부여할 수 있습니다.", ephemeral=True)
+    if interaction.user.id != bot.application_owner_id:
+        await interaction.response.send_message("봇 소유자만 통합 관리자 권한을 부여할 수 있습니다.", ephemeral=True)
         return
     if 유저.bot:
         await interaction.response.send_message("봇 계정에는 권한을 부여할 수 없습니다.", ephemeral=True)
         return
     set_bot_administrator(interaction.guild.id, 유저.id, True)
     await interaction.response.send_message(
-        f"{discord.utils.escape_mentions(유저.display_name)}님에게 공지 봇 관리자 권한을 부여했습니다.",
+        f"{discord.utils.escape_mentions(유저.display_name)}님에게 모든 서버에서 적용되는 공지 봇 관리자 권한을 부여했습니다.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -1342,16 +1345,16 @@ async def grant_bot_administrator(interaction: discord.Interaction, 유저: disc
 
 @admin_group.command(name="해제", description="유저의 공지용 봇 관리자 권한을 해제합니다.")
 @app_commands.describe(유저="공지 봇 관리자 권한을 해제할 유저")
-async def revoke_bot_administrator(interaction: discord.Interaction, 유저: discord.Member) -> None:
+async def revoke_bot_administrator(interaction: discord.Interaction, 유저: discord.User) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 권한을 해제할 수 있습니다.", ephemeral=True)
+    if interaction.user.id != bot.application_owner_id:
+        await interaction.response.send_message("봇 소유자만 통합 관리자 권한을 해제할 수 있습니다.", ephemeral=True)
         return
     set_bot_administrator(interaction.guild.id, 유저.id, False)
     await interaction.response.send_message(
-        f"{discord.utils.escape_mentions(유저.display_name)}님의 공지 봇 관리자 권한을 해제했습니다.",
+        f"{discord.utils.escape_mentions(유저.display_name)}님의 모든 서버 공통 공지 봇 관리자 권한을 해제했습니다.",
         ephemeral=True,
         allowed_mentions=discord.AllowedMentions.none(),
     )
@@ -1362,31 +1365,20 @@ async def list_bot_administrators(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 관리자 목록을 확인할 수 있습니다.", ephemeral=True)
+    if interaction.user.id != bot.application_owner_id:
+        await interaction.response.send_message("봇 소유자만 통합 관리자 목록을 확인할 수 있습니다.", ephemeral=True)
         return
-
-    entries = [
-        f"• 봇 소유자 (`{bot.application_owner_id}`)",
-        f"• 서버 소유자 (`{interaction.guild.owner_id}`)",
-    ]
-    for user_id in get_bot_administrator_ids(interaction.guild.id):
-        member = interaction.guild.get_member(user_id)
-        if member is None:
-            try:
-                member = await interaction.guild.fetch_member(user_id)
-            except discord.HTTPException:
-                entries.append(f"• 알 수 없는 사용자 (`{user_id}`)")
-                continue
-        entries.append(f"• {safe_name(member)} (`{user_id}`)")
-
-    embed = discord.Embed(title="공지 봇 관리자 목록", description="\n".join(entries), colour=discord.Colour.blurple())
-    embed.set_footer(text="봇 소유자와 서버 소유자는 항상 공지 관리 권한을 가집니다.")
-    await interaction.response.send_message(
-        embed=embed,
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+    await interaction.response.defer(ephemeral=True)
+    ids = get_bot_administrator_ids(interaction.guild.id)
+    for offset in range(0, max(1, len(ids)), 20):
+        entries = [f"• <@{uid}>" for uid in ids[offset:offset + 20]]
+        embed = discord.Embed(
+            title="봇 통합 공지 관리자 목록",
+            description="\n".join(entries) if entries else "등록된 관리자가 없습니다.",
+            colour=discord.Colour.blurple(),
+        )
+        embed.set_footer(text=f"총 {len(ids)}명 · {offset // 20 + 1}페이지 · 모든 서버에 공통 적용")
+        await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 warning_locks: dict[int, asyncio.Lock] = {}
