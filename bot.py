@@ -310,6 +310,25 @@ def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
             )
 
 
+def filter_exception_mentions(chunk: str) -> str:
+    exempt_ids = get_notice_exemptions(0)
+    return " ".join(token for token in chunk.split() if int(token.strip("<@!>")) not in exempt_ids)
+
+
+def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool) -> None:
+    with database() as connection:
+        # 이전 대기 신청을 처리해 수동 제거 이후 다시 승인되는 것을 방지합니다.
+        connection.execute("DELETE FROM absence_requests WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+        if adding:
+            connection.execute(
+                "INSERT INTO approved_absences VALUES (?, ?, ?, ?) ON CONFLICT(guild_id, user_id) "
+                "DO UPDATE SET reason = excluded.reason, approved_by = excluded.approved_by",
+                (guild_id, user_id, "소유주가 직접 등록한 불참자입니다.", owner_id),
+            )
+        else:
+            connection.execute("DELETE FROM approved_absences WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
+
+
 def is_bot_administrator(guild_id: int, user_id: int) -> bool:
     with database() as connection:
         row = connection.execute(
@@ -444,9 +463,11 @@ def make_mention_pages(members: list[discord.Member]) -> list[str]:
     return pages
 
 
-async def send_direct_notice(member: discord.Member, notice: str) -> bool:
+async def send_direct_notice(member: discord.Member, notice: str) -> bool | None:
     """DM 차단은 즉시 포기하고, 제한·일시 오류만 제한적으로 재시도합니다."""
     for attempt in range(NOTICE_RETRY_COUNT):
+        if member.id in get_notice_exemptions(0):
+            return None
         try:
             await member.send(
                 notice,
@@ -560,6 +581,9 @@ class ResultView(discord.ui.View):
             chunks.append(" ".join(current))
 
         for index, chunk in enumerate(chunks, start=1):
+            chunk = filter_exception_mentions(chunk)
+            if not chunk:
+                continue
             await interaction.channel.send(
                 f"반응 확인 부탁드립니다. ({index}/{len(chunks)})\n{chunk}",
                 allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
@@ -661,6 +685,9 @@ class MemberResultView(discord.ui.View):
             chunks.append(" ".join(current))
         if interaction.channel is not None:
             for chunk in chunks:
+                chunk = filter_exception_mentions(chunk)
+                if not chunk:
+                    continue
                 await interaction.channel.send(
                     f"{self.mention_message}\n{chunk}",
                     allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False),
@@ -1006,6 +1033,23 @@ async def meeting_notice(interaction: discord.Interaction) -> None:
     await interaction.response.send_modal(MeetingAnnouncementModal())
 
 
+@bot.tree.command(name="불참자", description="불참자를 직접 추가하거나 제거합니다.")
+@app_commands.guild_only()
+@app_commands.describe(동작="추가 또는 제거", 유저="불참 명단을 변경할 유저")
+@app_commands.choices(동작=[app_commands.Choice(name="추가", value="add"), app_commands.Choice(name="제거", value="remove")])
+async def manual_absence(interaction: discord.Interaction, 동작: app_commands.Choice[str], 유저: discord.Member) -> None:
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 불참자를 관리할 수 있습니다.", ephemeral=True)
+        return
+    if 유저.bot:
+        await interaction.response.send_message("봇은 불참자 대상이 아닙니다.", ephemeral=True)
+        return
+    adding = 동작.value == "add"
+    set_manual_absence(interaction.guild.id, 유저.id, interaction.user.id, adding)
+    action = "추가" if adding else "제거"
+    await interaction.response.send_message(f"{유저.mention}님을 불참자 명단에서 {action} 처리했습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.tree.command(name="불참자명단", description="승인된 불참자 명단을 확인합니다.")
 async def approved_absence_list(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
@@ -1193,18 +1237,21 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
     failed_members: list[discord.Member] = []
     total_members = 0
     exempt_count = 0
-    exempt_ids = get_notice_exemptions(interaction.guild.id)
 
     # fetch_members로 캐시에 없는 현재 서버 멤버도 포함합니다.
     async for member in interaction.guild.fetch_members(limit=None):
         if member.bot:
             continue
-        if member.id in exempt_ids:
+        if member.id in get_notice_exemptions(interaction.guild.id):
             exempt_count += 1
             continue
         total_members += 1
         notice = f"# [정점 공지]\n\n{내용}\n\n-# 공지 DM입니다 {member.mention}"
-        if await send_direct_notice(member, notice):
+        result = await send_direct_notice(member, notice)
+        if result is None:
+            total_members -= 1
+            exempt_count += 1
+        elif result:
             sent_count += 1
         else:
             failed_members.append(member)
