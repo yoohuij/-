@@ -115,6 +115,9 @@ def database() -> sqlite3.Connection:
         connection.execute("INSERT OR IGNORE INTO global_exemptions SELECT DISTINCT user_id FROM notice_exemptions")
         connection.execute("INSERT INTO schema_migrations VALUES ('global_exemptions')")
     connection.commit()
+    connection.execute("CREATE TABLE IF NOT EXISTS warning_settings (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)")
+    connection.execute("CREATE TABLE IF NOT EXISTS warning_snapshots (guild_id INTEGER, message_id INTEGER, user_id INTEGER, done INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(guild_id,message_id,user_id))")
+    connection.execute("CREATE TABLE IF NOT EXISTS warning_meetings (guild_id INTEGER, message_id INTEGER, PRIMARY KEY(guild_id,message_id))")
     return connection
 
 
@@ -1386,9 +1389,199 @@ async def list_bot_administrators(interaction: discord.Interaction) -> None:
     )
 
 
+warning_locks: dict[int, asyncio.Lock] = {}
+
+
+def save_warning_snapshot(guild_id: int, message_id: int, user_ids: list[int]) -> None:
+    with database() as connection:
+        connection.execute("INSERT OR IGNORE INTO warning_meetings VALUES (?, ?)", (guild_id, message_id))
+        connection.executemany(
+            "INSERT OR IGNORE INTO warning_snapshots(guild_id,message_id,user_id) VALUES (?, ?, ?)",
+            [(guild_id, message_id, uid) for uid in set(user_ids)],
+        )
+
+
+def warning_role(guild: discord.Guild) -> discord.Role:
+    with database() as connection:
+        row = connection.execute("SELECT role_id FROM warning_settings WHERE guild_id = ?", (guild.id,)).fetchone()
+    role = guild.get_role(row[0]) if row else None
+    if role is None:
+        raise ValueError("먼저 `/경고역할`로 사용할 역할을 지정해 주세요.")
+    me = guild.me
+    if role.is_default() or role.managed or me is None or not me.guild_permissions.manage_roles or role >= me.top_role:
+        raise ValueError("봇의 역할 관리 권한을 켜고, 봇 역할을 경고 역할보다 위로 올려 주세요. 기본·자동 관리 역할은 사용할 수 없습니다.")
+    return role
+
+
+def can_warn(interaction: discord.Interaction) -> bool:
+    return is_owner(interaction) or (
+        isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_roles
+    )
+
+
+async def change_warning_roles(interaction: discord.Interaction, ids: list[int], adding: bool, message_id: int | None = None) -> str:
+    guild = interaction.guild
+    role = warning_role(guild)
+    if not is_owner(interaction) and role >= interaction.user.top_role:
+        raise ValueError("자신의 최고 역할보다 낮은 경고 역할만 관리할 수 있습니다.")
+    success, skipped, failed = 0, 0, []
+    for uid in dict.fromkeys(ids):
+        done = False
+        if adding and (uid in get_notice_exemptions(guild.id) or (message_id is not None and get_approved_absence(guild.id, uid) is not None)):
+            skipped += 1
+            done = True
+        else:
+            try:
+                member = await guild.fetch_member(uid)
+                if member.bot:
+                    skipped += 1
+                elif (role in member.roles) == adding:
+                    skipped += 1
+                else:
+                    if adding:
+                        await member.add_roles(role, reason=f"경고 부여 요청자: {interaction.user.id}")
+                    else:
+                        await member.remove_roles(role, reason=f"경고 제거 요청자: {interaction.user.id}")
+                    success += 1
+                done = True
+            except discord.NotFound:
+                skipped += 1
+                done = True
+            except discord.HTTPException:
+                failed.append(uid)
+        if message_id is not None and done:
+            with database() as connection:
+                connection.execute("UPDATE warning_snapshots SET done = 1 WHERE guild_id = ? AND message_id = ? AND user_id = ?", (guild.id, message_id, uid))
+    action = "부여" if adding else "제거"
+    text = f"경고 {action}: 성공 {success}명 · 제외/변경 없음 {skipped}명 · 실패 {len(failed)}명"
+    if failed:
+        text += "\n실패 목록: " + " ".join(f"<@{uid}>" for uid in failed[:40])
+        if len(failed) > 40:
+            text += f" 외 {len(failed) - 40}명"
+        if message_id is not None:
+            text += "\n권한을 확인한 뒤 같은 버튼으로 실패한 대상만 다시 처리할 수 있습니다."
+    return text
+
+
+class WarningListView(discord.ui.View):
+    def __init__(self, owner_id: int, members: list[discord.Member]):
+        super().__init__(timeout=900)
+        self.owner_id = owner_id
+        self.pages = make_member_pages(members, "경고자가 없습니다.")
+        self.total = len(members)
+        self.page = 0
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next.disabled = self.page == len(self.pages) - 1
+
+    def embed(self):
+        embed = discord.Embed(title="경고자 목록", description=self.pages[self.page], colour=discord.Colour.orange())
+        embed.set_footer(text=f"총 {self.total}명 · {self.page + 1}/{len(self.pages)}페이지 · 페이지당 최대 20명")
+        return embed
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id == self.owner_id:
+            return True
+        await interaction.response.send_message("목록을 조회한 사람만 사용할 수 있습니다.", ephemeral=True)
+        return False
+
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, button):
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction, button):
+        self.page = min(len(self.pages) - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
+@bot.tree.command(name="경고역할", description="경고로 사용할 역할 하나를 지정하거나 교체합니다.")
+@app_commands.guild_only()
+@app_commands.describe(역할="경고 부여 시 지급할 역할")
+async def set_warning_role(interaction: discord.Interaction, 역할: discord.Role):
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 지정할 수 있습니다.", ephemeral=True)
+        return
+    me = interaction.guild.me
+    if 역할.is_default() or 역할.managed or me is None or not me.guild_permissions.manage_roles or 역할 >= me.top_role:
+        await interaction.response.send_message("봇에 역할 관리 권한이 필요하며, 경고 역할은 봇 역할보다 아래에 있어야 합니다. 기본·자동 관리 역할은 지정할 수 없습니다.", ephemeral=True)
+        return
+    with database() as connection:
+        connection.execute("INSERT INTO warning_settings VALUES (?, ?) ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id", (interaction.guild.id, 역할.id))
+    await interaction.response.send_message(f"경고 역할을 {역할.mention}로 지정했습니다. 기존 역할을 자동 이동하지는 않습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="경고", description="최대 10명의 유저에게 경고 역할을 부여하거나 제거합니다.")
+@app_commands.guild_only()
+@app_commands.choices(동작=[app_commands.Choice(name="부여", value="add"), app_commands.Choice(name="제거", value="remove")])
+async def warning_command(interaction: discord.Interaction, 동작: app_commands.Choice[str],
+    user1: discord.Member, user2: discord.Member | None = None, user3: discord.Member | None = None,
+    user4: discord.Member | None = None, user5: discord.Member | None = None, user6: discord.Member | None = None,
+    user7: discord.Member | None = None, user8: discord.Member | None = None, user9: discord.Member | None = None,
+    user10: discord.Member | None = None):
+    if not can_warn(interaction):
+        await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    members = [m.id for m in (user1,user2,user3,user4,user5,user6,user7,user8,user9,user10) if m is not None]
+    async with warning_locks.setdefault(interaction.guild.id, asyncio.Lock()):
+        try:
+            result = await change_warning_roles(interaction, members, 동작.value == "add")
+        except ValueError as error:
+            result = str(error)
+    await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="경고목록", description="경고 역할이 있는 사람을 20명씩 확인합니다.")
+@app_commands.guild_only()
+async def warning_list(interaction: discord.Interaction):
+    if not can_warn(interaction):
+        await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        with database() as connection:
+            row = connection.execute("SELECT role_id FROM warning_settings WHERE guild_id = ?", (interaction.guild.id,)).fetchone()
+        role = interaction.guild.get_role(row[0]) if row else None
+        if role is None:
+            raise ValueError("먼저 `/경고역할`을 지정해 주세요.")
+        members = [m async for m in interaction.guild.fetch_members(limit=None) if not m.bot and role in m.roles]
+        view = WarningListView(interaction.user.id, members)
+        await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    except (ValueError, discord.HTTPException):
+        await interaction.followup.send("경고 역할 설정과 멤버 조회 권한을 확인해 주세요.", ephemeral=True)
+
+
 class MeetingEndView(discord.ui.View):
     def __init__(self) -> None:
         super().__init__(timeout=None)
+
+    @discord.ui.button(label="미참여자 경고 부여", style=discord.ButtonStyle.danger, custom_id="meeting_end_warn")
+    async def warn_missing(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if not can_warn(interaction):
+            await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild_id, message_id = interaction.guild.id, interaction.message.id
+        async with warning_locks.setdefault(guild_id, asyncio.Lock()):
+            with database() as connection:
+                exists = connection.execute("SELECT 1 FROM warning_meetings WHERE guild_id=? AND message_id=?", (guild_id,message_id)).fetchone()
+                rows = connection.execute("SELECT user_id FROM warning_snapshots WHERE guild_id=? AND message_id=? AND done=0", (guild_id,message_id)).fetchall()
+            if not exists:
+                result = "이 종료 메시지에는 저장된 미참여자 명단이 없습니다."
+            elif not rows:
+                result = "경고 대상이 없거나 모두 처리되었습니다."
+            else:
+                try:
+                    result = await change_warning_roles(interaction, [r[0] for r in rows], True, message_id)
+                except ValueError as error:
+                    result = str(error)
+        await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @discord.ui.button(label="사유 초기화", style=discord.ButtonStyle.danger, custom_id="meeting_end_reset")
     async def reset(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1437,6 +1630,14 @@ async def change_meeting_state(interaction: discord.Interaction, starting: bool)
         if not isinstance(channel, discord.TextChannel):
             await interaction.followup.send("공지방을 먼저 등록해 주세요.", ephemeral=True)
             return
+        missing_ids = []
+        if not starting:
+            meeting_channel = interaction.guild.get_channel(settings.meeting_channel_id)
+            if not isinstance(meeting_channel, (discord.VoiceChannel, discord.StageChannel)):
+                await interaction.followup.send("회의방을 찾을 수 없습니다. 회의방을 다시 등록한 뒤 종료해 주세요.", ephemeral=True)
+                return
+            missing, _ = await get_meeting_non_participants(interaction.guild, settings.meeting_channel_id)
+            missing_ids = [member.id for member in missing]
         # 송신 중에도 시작/종료 상태가 적용되며, 실패하면 이전 상태로 복구합니다.
         set_meeting_phase(guild_id, "active" if starting else "ended")
         message = await channel.send(
@@ -1450,10 +1651,11 @@ async def change_meeting_state(interaction: discord.Interaction, starting: bool)
         await interaction.followup.send("안내를 전송하지 못했습니다. 공지방 권한을 확인해 주세요.", ephemeral=True)
         return
     if not starting:
+        save_warning_snapshot(guild_id, message.id, missing_ids)
         set_meeting_phase(guild_id, "ended", message.id)
     await interaction.followup.send(
         "회의를 시작했습니다. 입퇴장 로그를 켜고 사유 신청을 마감했습니다." if starting
-        else "회의를 종료하고 입퇴장 로그를 껐습니다. 종료 안내의 버튼으로 사유를 초기화할 수 있습니다.",
+        else f"회의를 종료하고 입퇴장 로그를 껐습니다. 종료 시점 미참여자 {len(missing_ids)}명을 저장했습니다. 종료 안내에서 경고 부여·사유 초기화를 할 수 있습니다.",
         ephemeral=True,
     )
 
