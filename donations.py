@@ -1,6 +1,5 @@
 """Global donation ledger with per-server announcement and ranking configuration."""
 import asyncio
-import io
 import re
 from contextlib import contextmanager
 
@@ -26,7 +25,7 @@ def render_ranking(template: str, totals, extra_text=None) -> str:
         for index, prefix in enumerate(RANK_PREFIXES):
             user, money = (f'<@{totals[index][0]}>', str(totals[index][1])) if index < len(totals) else ('없음', '0')
             result = result.replace('{' + prefix + 'user}', user).replace('{' + prefix + 'money}', money)
-        extras = ', '.join(f'<@{uid}>' for uid, _ in totals[3:]) or '없음'
+        extras = ', '.join(f'<@{uid}>' for uid, _ in totals[3:])
         return result.replace('{exuser}', extras if extra_text is None else extra_text)
     # Previously saved per-rank templates continue working until replaced.
     return '\n\n'.join(render(template, uid, amount, rank) for rank, (uid, amount) in enumerate(totals[:3], 1)) or '아직 후원 기록이 없습니다.'
@@ -43,6 +42,7 @@ class DonationStore:
             with db:
                 db.execute('CREATE TABLE IF NOT EXISTS donation_records (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount > 0), guild_id INTEGER NOT NULL, recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_settings (guild_id INTEGER PRIMARY KEY, notice_channel INTEGER, ranking_channel INTEGER, notice_template TEXT, ranking_template TEXT, ranking_message INTEGER)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_ranking_pages (channel_id INTEGER NOT NULL, page INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(channel_id,page))')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_adjustments (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount < 0), recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_corrections (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, operation TEXT NOT NULL, recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 yield db
@@ -164,26 +164,44 @@ class DonationFeature:
             raise ValueError('먼저 `/후원랭킹메시지`로 양식을 등록해 주세요.')
         totals = self.store.totals()
         content = render_ranking(template, totals)
-        attachments = []
-        if len(content) > 2000 and '{exuser}' in template:
-            # Keep the existing ranking message and include every remaining donor.
-            lines = []
-            for rank, (uid, _) in enumerate(totals[3:], 4):
-                user = self.bot.get_user(uid)
-                lines.append(f'{rank}. {user} (ID: {uid})' if user else f'{rank}. User ID: {uid}')
-            attachments = [discord.File(io.BytesIO('\n'.join(lines).encode('utf-8-sig')), filename='other-donors.txt')]
-            content = render_ranking(template, totals, '전체 명단은 첨부된 other-donors.txt 파일을 확인해 주세요.')
-        if len(content) > 2000:
-            raise ValueError('랭킹 양식이 너무 깁니다. 더 짧게 등록해 주세요.')
-        if config['ranking_message']:
-            try:
-                message = await channel.fetch_message(config['ranking_message'])
-                await message.edit(content=content, attachments=attachments, allowed_mentions=discord.AllowedMentions.none())
-                return
-            except discord.NotFound:
-                pass
-        message = await channel.send(content, files=attachments, allowed_mentions=discord.AllowedMentions.none())
-        self.store.configure(guild_id, ranking_message=message.id)
+        chunks = []
+        while len(content) > 2000:
+            boundary = max(content.rfind('\n', 0, 1950), content.rfind(' ', 0, 1950))
+            boundary = boundary + 1 if boundary >= 0 else 1950
+            # Never split a Discord mention across messages.
+            start = content.rfind('<', 0, boundary)
+            if start >= 0 and content.find('>', start) >= boundary:
+                boundary = start or content.find('>', start) + 1
+            chunks.append(content[:boundary])
+            content = content[boundary:]
+        chunks.append(content or '\u200b')
+        with self.store.connection() as db:
+            pages = dict(db.execute('SELECT page,message_id FROM donation_ranking_pages WHERE channel_id=?', (channel.id,)))
+        for page, chunk in enumerate(chunks):
+            message_id = config['ranking_message'] if page == 0 else pages.get(page)
+            message = None
+            if message_id:
+                try:
+                    message = await channel.fetch_message(message_id)
+                    await message.edit(content=chunk, attachments=[], allowed_mentions=discord.AllowedMentions.none())
+                except discord.NotFound:
+                    message = None
+            if message is None:
+                message = await channel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+                if page == 0:
+                    self.store.configure(guild_id, ranking_message=message.id)
+                else:
+                    with self.store.connection() as db:
+                        db.execute('INSERT OR REPLACE INTO donation_ranking_pages VALUES (?,?,?)', (channel.id, page, message.id))
+        for page, message_id in pages.items():
+            if page >= len(chunks):
+                try:
+                    message = await channel.fetch_message(message_id)
+                    await message.delete()
+                except discord.NotFound:
+                    pass
+                with self.store.connection() as db:
+                    db.execute('DELETE FROM donation_ranking_pages WHERE channel_id=? AND page=?', (channel.id, page))
 
 
 class DonationTemplateModal(discord.ui.Modal):
