@@ -495,7 +495,8 @@ class ResultView(discord.ui.View):
         embed.add_field(name="선택 이모지", value=emoji_label, inline=True)
         embed.add_field(name="전체 일반 유저", value=f"{self.total_members}명", inline=True)
         embed.add_field(name="미반응자", value=f"{len(self.members)}명", inline=True)
-        embed.add_field(name="미반응자 목록", value=self.pages[self.page], inline=False)
+        # 긴 목록은 필드 대신 임베드 본문에 표시합니다.
+        embed.description = self.pages[self.page]
         embed.set_footer(text=f"페이지 {self.page + 1}/{len(self.pages)} · 목록에서는 멘션되지 않습니다.")
         return embed
 
