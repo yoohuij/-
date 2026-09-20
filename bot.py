@@ -337,6 +337,7 @@ def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool)
 
 
 def is_bot_administrator(guild_id: int, user_id: int) -> bool:
+    """서버 ID는 기존 호출 호환용이며, 권한은 봇 전체 명단에서 조회합니다."""
     with database() as connection:
         row = connection.execute(
             "SELECT 1 FROM global_administrators WHERE user_id = ?",
