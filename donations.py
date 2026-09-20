@@ -41,6 +41,8 @@ class DonationStore:
             with db:
                 db.execute('CREATE TABLE IF NOT EXISTS donation_records (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount > 0), guild_id INTEGER NOT NULL, recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_settings (guild_id INTEGER PRIMARY KEY, notice_channel INTEGER, ranking_channel INTEGER, notice_template TEXT, ranking_template TEXT, ranking_message INTEGER)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_adjustments (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount < 0), recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_corrections (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, operation TEXT NOT NULL, recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 yield db
         finally:
             db.close()
@@ -66,7 +68,30 @@ class DonationStore:
 
     def totals(self):
         with self.connection() as db:
-            return db.execute('SELECT user_id, SUM(amount) AS total FROM donation_records GROUP BY user_id ORDER BY total DESC, user_id ASC').fetchall()
+            return db.execute('SELECT user_id, SUM(amount) AS total FROM (SELECT user_id, amount FROM donation_records UNION ALL SELECT user_id, amount FROM donation_adjustments) GROUP BY user_id HAVING SUM(amount) > 0 ORDER BY total DESC, user_id ASC').fetchall()
+
+    def correct(self, interaction_id, user_id, actor, amount=None):
+        with self.connection() as db:
+            # Acquire the write lock before checking the balance.
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT 1 FROM donation_corrections WHERE interaction_id=?', (interaction_id,)).fetchone():
+                return None
+            total = db.execute('SELECT COALESCE(SUM(amount), 0) FROM (SELECT amount FROM donation_records WHERE user_id=? UNION ALL SELECT amount FROM donation_adjustments WHERE user_id=?)', (user_id, user_id)).fetchone()[0]
+            if amount is None:
+                if not db.execute('SELECT 1 FROM donation_records WHERE user_id=?', (user_id,)).fetchone():
+                    raise ValueError('해당 유저의 후원 기록이 없습니다.')
+                db.execute('DELETE FROM donation_records WHERE user_id=?', (user_id,))
+                db.execute('DELETE FROM donation_adjustments WHERE user_id=?', (user_id,))
+                remaining = 0
+            else:
+                if not 1 <= amount <= 10**12:
+                    raise ValueError('차감 금액은 1원 이상 1조 원 이하로 입력해 주세요.')
+                if amount > total:
+                    raise ValueError(f'현재 누적 금액은 {total}원입니다. 그보다 많이 차감할 수 없습니다.')
+                db.execute('INSERT INTO donation_adjustments(interaction_id,user_id,amount,recorded_by) VALUES (?,?,?,?)', (interaction_id, user_id, -amount, actor))
+                remaining = total - amount
+            db.execute('INSERT INTO donation_corrections(interaction_id,user_id,operation,recorded_by) VALUES (?,?,?,?)', (interaction_id, user_id, 'delete' if amount is None else 'deduct', actor))
+            return remaining
 
     def ranking_guilds(self):
         with self.connection() as db:
@@ -272,7 +297,42 @@ def install(bot, database):
     @app_commands.guild_only()
     async def donation_list(interaction: discord.Interaction):
         view = DonationList(interaction.user.id, feature.store.totals())
-        await interaction.response.send_message(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    async def correct_record(interaction, user, amount=None):
+        if not await feature.owner_check(interaction):
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with feature.lock:
+            try:
+                remaining = feature.store.correct(interaction.id, user.id, interaction.user.id, amount)
+            except ValueError as error:
+                await interaction.followup.send(str(error), ephemeral=True)
+                return
+            if remaining is None:
+                await interaction.followup.send('이미 처리한 요청입니다. 중복 처리하지 않았습니다.', ephemeral=True)
+                return
+            result = (f'{user.mention}님의 봇 전체 후원 기록을 삭제했습니다.' if amount is None
+                      else f'{user.mention}님의 후원금액에서 {amount}원을 차감했습니다. 남은 누적 금액: {remaining}원')
+            failures = 0
+            for guild_id in feature.store.ranking_guilds():
+                try:
+                    await feature.update_ranking(guild_id)
+                except (ValueError, discord.HTTPException):
+                    failures += 1
+            if failures:
+                result += f'\n기록은 반영되었지만 {failures}개 서버의 랭킹 갱신에 실패했습니다. 같은 요청을 새로 실행하지 말고 `/후원랭킹메시지`로 갱신해 주세요.'
+            await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @bot.tree.command(name='후원기록차감', description='봇 소유자 전용: 지정한 유저의 전체 누적 후원금액을 차감합니다.')
+    @app_commands.guild_only()
+    async def deduct_record(interaction: discord.Interaction, 유저: discord.User, 금액: app_commands.Range[int, 1, 10**12]):
+        await correct_record(interaction, 유저, 금액)
+
+    @bot.tree.command(name='후원기록삭제', description='봇 소유자 전용: 지정한 유저의 봇 전체 후원 기록을 삭제합니다.')
+    @app_commands.guild_only()
+    async def delete_record(interaction: discord.Interaction, 유저: discord.User):
+        await correct_record(interaction, 유저)
 
     return feature
 
