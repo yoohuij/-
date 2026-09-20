@@ -16,6 +16,20 @@ def render(template: str, user_id: int, money: int, rank: int | None = None) -> 
             .replace('{moeny}', str(money)).replace('{rank}', str(rank or 1)))
 
 
+RANK_PREFIXES = ('1st', '2nd', '3rd')
+
+
+def render_ranking(template: str, totals) -> str:
+    if any('{' + prefix + field + '}' in template for prefix in RANK_PREFIXES for field in ('user', 'money')):
+        result = discord.utils.escape_mentions(template)
+        for index, prefix in enumerate(RANK_PREFIXES):
+            user, money = (f'<@{totals[index][0]}>', str(totals[index][1])) if index < len(totals) else ('없음', '0')
+            result = result.replace('{' + prefix + 'user}', user).replace('{' + prefix + 'money}', money)
+        return result
+    # Previously saved per-rank templates continue working until replaced.
+    return '\n\n'.join(render(template, uid, amount, rank) for rank, (uid, amount) in enumerate(totals[:3], 1)) or '아직 후원 기록이 없습니다.'
+
+
 class DonationStore:
     def __init__(self, database):
         self.database = database
@@ -121,7 +135,7 @@ class DonationFeature:
         template = config['ranking_template']
         if not template:
             raise ValueError('먼저 `/후원랭킹메시지`로 양식을 등록해 주세요.')
-        content = '\n\n'.join(render(template, uid, amount, rank) for rank, (uid, amount) in enumerate(self.store.totals()[:3], 1)) or '아직 후원 기록이 없습니다.'
+        content = render_ranking(template, self.store.totals()[:3])
         if len(content) > 2000:
             raise ValueError('랭킹 양식이 너무 깁니다. 더 짧게 등록해 주세요.')
         if config['ranking_message']:
@@ -140,15 +154,22 @@ class DonationTemplateModal(discord.ui.Modal):
         super().__init__(title='후원 랭킹 양식 등록' if ranking else '후원 기록 공지 등록')
         self.feature, self.ranking = feature, ranking
         self.body = discord.ui.TextInput(label='출력 양식', style=discord.TextStyle.paragraph,
-            placeholder='# {rank}. {user} : {money}원' if ranking else '🎉 {user}님 {money}원 후원 감사합니다 🎉',
-            max_length=400 if ranking else 1500)
+            placeholder='1~3위 태그로 자유롭게 작성: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney}' if ranking else '🎉 {user}님 {money}원 후원 감사합니다 🎉',
+            max_length=1500)
         self.add_item(self.body)
 
     async def on_submit(self, interaction):
         if not await self.feature.owner_check(interaction):
             return
         template = self.body.value.strip()
-        if '{user}' not in template or not any(t in template for t in ('{money}', '{moeny}')):
+        if self.ranking:
+            if not all('{' + prefix + field + '}' in template for prefix in RANK_PREFIXES for field in ('user', 'money')):
+                await interaction.response.send_message('1·2·3위의 태그를 모두 넣어 주세요: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney}', ephemeral=True)
+                return
+            if len(render_ranking(template, [(10**20, 10**18)] * 3)) > 2000:
+                await interaction.response.send_message('치환 후 메시지가 너무 깁니다. 양식을 줄여 주세요.', ephemeral=True)
+                return
+        elif '{user}' not in template or not any(t in template for t in ('{money}', '{moeny}')):
             await interaction.response.send_message('양식에 {user}와 {money}를 넣어 주세요. {moeny}도 금액으로 인식합니다.', ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
@@ -200,7 +221,7 @@ def install(bot, database):
         if await feature.owner_check(interaction):
             await interaction.response.send_modal(DonationTemplateModal(feature, False))
 
-    @bot.tree.command(name='후원랭킹메시지', description='상위 3명 랭킹의 한 줄 양식을 등록하고 메시지를 게시합니다.')
+    @bot.tree.command(name='후원랭킹메시지', description='1·2·3위 태그를 사용한 랭킹 전체 양식을 등록하고 게시합니다.')
     @app_commands.guild_only()
     async def ranking_template(interaction: discord.Interaction):
         if await feature.owner_check(interaction):
