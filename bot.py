@@ -1690,6 +1690,9 @@ bot.tree.add_command(meeting_group)
 bot.tree.add_command(group)
 bot.tree.add_command(admin_group)
 
+import donations
+donation_feature = donations.install(bot, database)
+
 
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
