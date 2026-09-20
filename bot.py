@@ -109,6 +109,12 @@ def database() -> sqlite3.Connection:
         "CREATE TABLE IF NOT EXISTS meeting_status ("
         "guild_id INTEGER PRIMARY KEY, phase TEXT NOT NULL, end_message_id INTEGER)"
     )
+    connection.execute("CREATE TABLE IF NOT EXISTS global_exemptions (user_id INTEGER PRIMARY KEY)")
+    connection.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY)")
+    if connection.execute("SELECT 1 FROM schema_migrations WHERE name = 'global_exemptions'").fetchone() is None:
+        connection.execute("INSERT OR IGNORE INTO global_exemptions SELECT DISTINCT user_id FROM notice_exemptions")
+        connection.execute("INSERT INTO schema_migrations VALUES ('global_exemptions')")
+    connection.commit()
     return connection
 
 
@@ -285,7 +291,7 @@ def get_pending_request_message_ids() -> list[tuple[int, int]]:
 def get_notice_exemptions(guild_id: int) -> set[int]:
     with database() as connection:
         rows = connection.execute(
-            "SELECT user_id FROM notice_exemptions WHERE guild_id = ?", (guild_id,)
+            "SELECT user_id FROM global_exemptions ORDER BY user_id"
         ).fetchall()
     return {row[0] for row in rows}
 
@@ -294,13 +300,13 @@ def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
     with database() as connection:
         if is_exempt:
             connection.execute(
-                "INSERT OR IGNORE INTO notice_exemptions (guild_id, user_id) VALUES (?, ?)",
-                (guild_id, user_id),
+                "INSERT OR IGNORE INTO global_exemptions (user_id) VALUES (?)",
+                (user_id,),
             )
         else:
             connection.execute(
-                "DELETE FROM notice_exemptions WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
+                "DELETE FROM global_exemptions WHERE user_id = ?",
+                (user_id,),
             )
 
 
@@ -376,6 +382,9 @@ async def fetch_target_message(bot: discord.Client, target: CheckTarget) -> disc
 async def get_non_responders(
     bot: discord.Client, guild: discord.Guild, target: CheckTarget
 ) -> tuple[discord.Message, list[discord.Member], int]:
+    meeting_id = get_meeting_settings(guild.id).meeting_channel_id
+    if meeting_id is None or not isinstance(guild.get_channel(meeting_id), (discord.VoiceChannel, discord.StageChannel)):
+        raise ValueError("먼저 `/회의방등록`으로 현재 사용할 회의방을 등록해 주세요.")
     message = await fetch_target_message(bot, target)
     responded_ids: set[int] = set()
 
@@ -386,8 +395,7 @@ async def get_non_responders(
             if not user.bot:
                 responded_ids.add(user.id)
 
-    # fetch_members는 캐시에 없는 현재 서버 멤버까지 포함합니다.
-    members = [member async for member in guild.fetch_members(limit=None) if not member.bot]
+    members = await get_meeting_members(guild, meeting_id)
     non_responders = [member for member in members if member.id not in responded_ids]
     return message, non_responders, len(members)
 
@@ -493,9 +501,9 @@ class ResultView(discord.ui.View):
         embed = discord.Embed(title="반응 미확인자 조회", colour=discord.Colour.blurple())
         embed.add_field(name="확인 메시지", value=f"[메시지 보기]({self.source_message.jump_url})", inline=False)
         embed.add_field(name="선택 이모지", value=emoji_label, inline=True)
-        embed.add_field(name="전체 일반 유저", value=f"{self.total_members}명", inline=True)
+        embed.add_field(name="회의방 대상 인원 (예외 제외)", value=f"{self.total_members}명", inline=True)
         embed.add_field(name="미반응자", value=f"{len(self.members)}명", inline=True)
-        # 긴 목록은 필드 대신 임베드 본문에 표시합니다.
+        # 목록은 3,700자까지 나뉘므로 1,024자 제한의 필드 대신 본문에 표시합니다.
         embed.description = self.pages[self.page]
         embed.set_footer(text=f"페이지 {self.page + 1}/{len(self.pages)} · 목록에서는 멘션되지 않습니다.")
         return embed
@@ -518,6 +526,7 @@ class ResultView(discord.ui.View):
     async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer()
         try:
+            self.target = get_target(self.guild.id) or self.target
             self.source_message, self.members, self.total_members = await get_non_responders(self.bot, self.guild, self.target)
         except (discord.HTTPException, ValueError) as error:
             await interaction.followup.send(f"새로고침하지 못했습니다: {error}", ephemeral=True)
@@ -531,6 +540,12 @@ class ResultView(discord.ui.View):
     async def mention(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         # 실제 알림은 이 버튼을 눌렀을 때만, 일반 채널 메시지로 보냅니다.
         await interaction.response.defer(ephemeral=True)
+        try:
+            self.target = get_target(self.guild.id) or self.target
+            self.source_message, self.members, self.total_members = await get_non_responders(self.bot, self.guild, self.target)
+        except (discord.HTTPException, ValueError) as error:
+            await interaction.followup.send(f"현재 대상자를 확인하지 못했습니다: {error}", ephemeral=True)
+            return
         chunks: list[str] = []
         current: list[str] = []
         current_size = 0
@@ -630,6 +645,8 @@ class MemberResultView(discord.ui.View):
     @discord.ui.button(label="대상자 멘션", style=discord.ButtonStyle.danger)
     async def mention(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True)
+        exempt_ids = get_notice_exemptions(interaction.guild.id)
+        self.members = [member for member in self.members if member.id not in exempt_ids]
         chunks: list[str] = []
         current: list[str] = []
         current_size = 0
@@ -876,10 +893,12 @@ async def on_voice_state_update(
 
 
 async def get_meeting_members(guild: discord.Guild, meeting_channel_id: int) -> list[discord.Member]:
+    exempt_ids = get_notice_exemptions(guild.id)
     return [
         member
         async for member in guild.fetch_members(limit=None)
         if not member.bot
+        and member.id not in exempt_ids
         and member.voice is not None
         and member.voice.channel is not None
         and member.voice.channel.id == meeting_channel_id
@@ -891,6 +910,7 @@ async def get_meeting_non_participants(
 ) -> tuple[list[discord.Member], int]:
     members = [member async for member in guild.fetch_members(limit=None) if not member.bot]
     approved_absence_ids = {user_id for user_id, _ in get_approved_absences(guild.id)}
+    approved_absence_ids |= get_notice_exemptions(guild.id)
     eligible_members = [member for member in members if member.id not in approved_absence_ids]
     non_participants = [
         member
@@ -1140,6 +1160,9 @@ async def check_non_responders(interaction: discord.Interaction) -> None:
     except discord.NotFound:
         await interaction.followup.send("등록된 메시지 또는 채널을 찾지 못했습니다. 다시 등록해 주세요.", ephemeral=True)
         return
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
     except discord.Forbidden:
         await interaction.followup.send("메시지·반응·멤버 목록을 볼 권한이 없습니다.", ephemeral=True)
         return
@@ -1207,37 +1230,48 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
         )
 
 
-@bot.tree.command(name="공지예외인원설정", description="특정 유저를 공지 DM 대상에서 추가하거나 제거합니다.")
-@app_commands.describe(유저="공지 DM 예외로 설정할 유저", 동작="예외 명단에 추가하거나 제거합니다.")
-@app_commands.choices(
-    동작=[
-        app_commands.Choice(name="추가", value="add"),
-        app_commands.Choice(name="제거", value="remove"),
-    ]
-)
-async def set_notice_exempt_member(
-    interaction: discord.Interaction,
-    유저: discord.Member,
-    동작: app_commands.Choice[str],
-) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        return
-    if not can_use_notice_admin(interaction):
-        await interaction.response.send_message("공지 봇 관리자 권한이 필요합니다.", ephemeral=True)
-        return
-    if 유저.bot:
-        await interaction.response.send_message("봇 계정은 공지 대상이 아니므로 설정할 수 없습니다.", ephemeral=True)
-        return
+exception_group = app_commands.Group(name="예외설정", description="봇 전체에서 공통으로 적용할 예외 인원을 관리합니다.")
 
-    is_exempt = 동작.value == "add"
-    set_notice_exemption(interaction.guild.id, 유저.id, is_exempt)
-    action_text = "공지 예외 명단에 추가했습니다" if is_exempt else "공지 예외 명단에서 제거했습니다"
-    await interaction.response.send_message(
-        f"{discord.utils.escape_mentions(유저.display_name)}님을 {action_text}.",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
+
+async def exception_permission(interaction: discord.Interaction) -> bool:
+    if interaction.user.id == bot.application_owner_id:
+        return True
+    await interaction.response.send_message("봇 소유자만 전체 예외 명단을 관리할 수 있습니다.", ephemeral=True)
+    return False
+
+
+@exception_group.command(name="추가", description="모든 서버에서 예외로 처리할 인원을 추가합니다.")
+@app_commands.describe(인원="예외로 추가할 사용자")
+async def add_global_exception(interaction: discord.Interaction, 인원: discord.User) -> None:
+    if not await exception_permission(interaction):
+        return
+    set_notice_exemption(0, 인원.id, True)
+    await interaction.response.send_message(f"{인원.mention}님을 봇 전체 예외에 추가했습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@exception_group.command(name="제거", description="봇 전체 예외 인원을 제거합니다.")
+@app_commands.describe(인원="예외에서 제거할 사용자")
+async def remove_global_exception(interaction: discord.Interaction, 인원: discord.User) -> None:
+    if not await exception_permission(interaction):
+        return
+    set_notice_exemption(0, 인원.id, False)
+    await interaction.response.send_message(f"{인원.mention}님을 봇 전체 예외에서 제거했습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@exception_group.command(name="목록", description="봇 전체 예외 명단을 나에게만 표시합니다.")
+async def list_global_exceptions(interaction: discord.Interaction) -> None:
+    if not await exception_permission(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    ids = sorted(get_notice_exemptions(0))
+    for offset in range(0, max(1, len(ids)), 20):
+        page = "\n".join(f"• <@{uid}>" for uid in ids[offset:offset + 20]) or "등록된 예외 인원이 없습니다."
+        embed = discord.Embed(title="봇 전체 예외 명단", description=page, colour=discord.Colour.blurple())
+        embed.set_footer(text=f"총 {len(ids)}명 · {offset // 20 + 1}페이지")
+        await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+bot.tree.add_command(exception_group)
 
 
 @admin_group.command(name="부여", description="유저에게 공지용 봇 관리자 권한을 부여합니다.")
