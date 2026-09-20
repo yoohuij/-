@@ -1230,9 +1230,6 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
         )
 
 
-exception_group = app_commands.Group(name="예외설정", description="봇 전체에서 공통으로 적용할 예외 인원을 관리합니다.")
-
-
 async def exception_permission(interaction: discord.Interaction) -> bool:
     if interaction.user.id == bot.application_owner_id:
         return True
@@ -1240,25 +1237,27 @@ async def exception_permission(interaction: discord.Interaction) -> bool:
     return False
 
 
-@exception_group.command(name="추가", description="모든 서버에서 예외로 처리할 인원을 추가합니다.")
-@app_commands.describe(인원="예외로 추가할 사용자")
-async def add_global_exception(interaction: discord.Interaction, 인원: discord.User) -> None:
+@bot.tree.command(name="예외설정", description="봇 전체 예외 인원을 추가하거나 제거합니다.")
+@app_commands.describe(동작="추가 또는 제거를 선택하세요", 유저="예외를 설정할 사용자")
+@app_commands.choices(동작=[
+    app_commands.Choice(name="추가", value="add"),
+    app_commands.Choice(name="제거", value="remove"),
+])
+async def set_global_exception(
+    interaction: discord.Interaction, 동작: app_commands.Choice[str], 유저: discord.User
+) -> None:
     if not await exception_permission(interaction):
         return
-    set_notice_exemption(0, 인원.id, True)
-    await interaction.response.send_message(f"{인원.mention}님을 봇 전체 예외에 추가했습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    adding = 동작.value == "add"
+    set_notice_exemption(0, 유저.id, adding)
+    result = "예외에 추가했습니다" if adding else "예외에서 제거했습니다"
+    await interaction.response.send_message(
+        f"{유저.mention}님을 봇 전체 {result}.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
-@exception_group.command(name="제거", description="봇 전체 예외 인원을 제거합니다.")
-@app_commands.describe(인원="예외에서 제거할 사용자")
-async def remove_global_exception(interaction: discord.Interaction, 인원: discord.User) -> None:
-    if not await exception_permission(interaction):
-        return
-    set_notice_exemption(0, 인원.id, False)
-    await interaction.response.send_message(f"{인원.mention}님을 봇 전체 예외에서 제거했습니다.", ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-@exception_group.command(name="목록", description="봇 전체 예외 명단을 나에게만 표시합니다.")
+@bot.tree.command(name="예외목록", description="봇 전체 예외 명단을 나에게만 표시합니다.")
 async def list_global_exceptions(interaction: discord.Interaction) -> None:
     if not await exception_permission(interaction):
         return
@@ -1269,9 +1268,6 @@ async def list_global_exceptions(interaction: discord.Interaction) -> None:
         embed = discord.Embed(title="봇 전체 예외 명단", description=page, colour=discord.Colour.blurple())
         embed.set_footer(text=f"총 {len(ids)}명 · {offset // 20 + 1}페이지")
         await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-
-
-bot.tree.add_command(exception_group)
 
 
 @admin_group.command(name="부여", description="유저에게 공지용 봇 관리자 권한을 부여합니다.")
