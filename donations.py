@@ -7,13 +7,14 @@ import discord
 from discord import app_commands
 
 
-def render(template: str, user_id: int, money: int, rank: int | None = None) -> str:
+def render(template: str, user_id: int, money: int, rank: int | None = None, *, usermoney: int | None = None) -> str:
     # Only replace supported tokens; arbitrary braces in user text remain intact.
     value = discord.utils.escape_mentions(template)
     if rank is not None and '{rank}' not in value:
         value = re.sub(r'^(\s*#{0,3}\s*)\d+\.', lambda m: m[1] + str(rank) + '.', value, count=1)
     return (value.replace('{user}', f'<@{user_id}>').replace('{money}', str(money))
-            .replace('{moeny}', str(money)).replace('{rank}', str(rank or 1)))
+            .replace('{moeny}', str(money)).replace('{rank}', str(rank or 1))
+            .replace('{usermoney}', str(money if usermoney is None else usermoney)))
 
 
 RANK_PREFIXES = ('1st', '2nd', '3rd')
@@ -209,7 +210,7 @@ class DonationTemplateModal(discord.ui.Modal):
         super().__init__(title='후원 랭킹 양식 등록' if ranking else '후원 기록 공지 등록')
         self.feature, self.ranking = feature, ranking
         self.body = discord.ui.TextInput(label='출력 양식', style=discord.TextStyle.paragraph,
-            placeholder='1~3위: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney} / 나머지 후원자: {exuser}' if ranking else '🎉 {user}님 {money}원 후원 감사합니다 🎉',
+            placeholder='1~3위: {1stuser}, {1stmoney}, {2nduser}, {2ndmoney}, {3rduser}, {3rdmoney} / 나머지 후원자: {exuser}' if ranking else '🎉 {user}님 {money}원 후원 감사합니다! 누적 후원: {usermoney}원 🎉',
             max_length=1500)
         self.add_item(self.body)
 
@@ -224,8 +225,8 @@ class DonationTemplateModal(discord.ui.Modal):
             if len(render_ranking(template, [(10**20, 10**18)] * 3)) > 2000:
                 await interaction.response.send_message('치환 후 메시지가 너무 깁니다. 양식을 줄여 주세요.', ephemeral=True)
                 return
-        elif '{user}' not in template or not any(t in template for t in ('{money}', '{moeny}')):
-            await interaction.response.send_message('양식에 {user}와 {money}를 넣어 주세요. {moeny}도 금액으로 인식합니다.', ephemeral=True)
+        elif '{user}' not in template or not any(t in template for t in ('{money}', '{moeny}', '{usermoney}')):
+            await interaction.response.send_message('양식에 {user}와 {money}(이번 금액) 또는 {usermoney}(누적 금액)를 넣어 주세요. {moeny}도 이번 금액으로 인식합니다.', ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         async with self.feature.lock:
@@ -270,7 +271,7 @@ def install(bot, database):
     async def ranking_channel(interaction: discord.Interaction, 방: discord.TextChannel):
         await register_channel(interaction, 방, True)
 
-    @bot.tree.command(name='후원기록공지등록', description='후원 공지에 사용할 {user}, {money} 양식을 등록합니다.')
+    @bot.tree.command(name='후원기록공지등록', description='후원 공지 양식: {user} 유저, {money} 이번 금액, {usermoney} 누적 금액')
     @app_commands.guild_only()
     async def notice_template(interaction: discord.Interaction):
         if await feature.owner_check(interaction):
@@ -309,7 +310,8 @@ def install(bot, database):
                 return
             problems = []
             try:
-                await channel.send(render(config['notice_template'], 유저.id, 금액),
+                total = dict(feature.store.totals()).get(유저.id, 0)
+                await channel.send(render(config['notice_template'], 유저.id, 금액, usermoney=total),
                     allowed_mentions=discord.AllowedMentions(users=[유저], roles=False, everyone=False))
             except discord.HTTPException:
                 problems.append('후원 공지 전송 실패')
