@@ -1,6 +1,8 @@
 import asyncio
 import os
 import sqlite3
+import time
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1686,6 +1688,119 @@ async def end_meeting(interaction: discord.Interaction) -> None:
     await change_meeting_state(interaction, False)
 
 
+nickname_locks: dict[int, asyncio.Lock] = {}
+
+
+def nickname_database():
+    connection = database()
+    connection.execute("CREATE TABLE IF NOT EXISTS nickname_excluded_roles (guild_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id, role_id))")
+    connection.execute("CREATE TABLE IF NOT EXISTS nickname_history (guild_id INTEGER, user_id INTEGER, base TEXT, applied TEXT, prefix TEXT, PRIMARY KEY(guild_id, user_id))")
+    connection.commit()
+    return connection
+
+
+def role_nickname(member, excluded, history):
+    """Only remove a prefix we previously applied; preserve manually written names."""
+    role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
+    base = member.nick
+    if history:
+        old_base, applied, prefix = history
+        if base == applied:
+            base = old_base
+        elif base and prefix and base.startswith(prefix):
+            base = base[len(prefix):] or None
+    prefix = f"『{role.name} 』" if role else ""
+    target = prefix + (base or member.global_name or member.name) if role else base
+    return base, target, prefix
+
+
+@bot.tree.command(name="역할예외설정", description="닉네임에서 제외할 역할 목록을 교체합니다. 모두 비우면 초기화합니다.")
+@app_commands.guild_only()
+async def nickname_exceptions(interaction: discord.Interaction,
+    역할1: discord.Role | None = None, 역할2: discord.Role | None = None,
+    역할3: discord.Role | None = None, 역할4: discord.Role | None = None,
+    역할5: discord.Role | None = None, 역할6: discord.Role | None = None,
+    역할7: discord.Role | None = None, 역할8: discord.Role | None = None,
+    역할9: discord.Role | None = None, 역할10: discord.Role | None = None):
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    lock = nickname_locks.setdefault(interaction.guild.id, asyncio.Lock())
+    if lock.locked():
+        await interaction.response.send_message("닉네임 변경 중입니다. 완료 후 설정해 주세요.", ephemeral=True)
+        return
+    roles = {r.id: r for r in (역할1, 역할2, 역할3, 역할4, 역할5, 역할6, 역할7, 역할8, 역할9, 역할10) if r is not None}
+    if any(r.guild.id != interaction.guild.id for r in roles.values()):
+        await interaction.response.send_message("현재 서버의 역할만 선택해 주세요.", ephemeral=True)
+        return
+    with closing(nickname_database()) as db, db:
+        db.execute("DELETE FROM nickname_excluded_roles WHERE guild_id=?", (interaction.guild.id,))
+        db.executemany("INSERT INTO nickname_excluded_roles VALUES (?,?)", [(interaction.guild.id, rid) for rid in roles])
+    await interaction.response.send_message(
+        "역할 닉네임 예외 목록을 교체했습니다: " + (", ".join(r.mention for r in roles.values()) or "없음")
+        + "\n/역할닉설정을 실행하면 적용됩니다. 기존 DM·인원 예외 설정과는 별개입니다.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="역할닉설정", description="서버 인원의 닉네임 앞에 예외를 제외한 최상위 역할명을 붙입니다.")
+@app_commands.guild_only()
+async def apply_role_nicknames(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    guild = interaction.guild
+    me = guild.me
+    if me is None or not me.guild_permissions.manage_nicknames:
+        await interaction.response.send_message("봇에 닉네임 관리 권한을 부여해 주세요.", ephemeral=True)
+        return
+    lock = nickname_locks.setdefault(guild.id, asyncio.Lock())
+    if lock.locked():
+        await interaction.response.send_message("이미 이 서버의 닉네임을 변경 중입니다.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with lock:
+        try:
+            members = await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
+        except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException):
+            await interaction.edit_original_response(content="전체 인원을 불러오지 못했습니다. Server Members Intent 설정을 확인해 주세요.")
+            return
+        with closing(nickname_database()) as db:
+            excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
+            history = {r[0]: r[1:] for r in db.execute("SELECT user_id,base,applied,prefix FROM nickname_history WHERE guild_id=?", (guild.id,))}
+        counts = {"변경": 0, "동일": 0, "권한·봇 제외": 0, "길이 초과": 0, "실패": 0}
+        started = time.monotonic()
+        processed = 0
+        for member in members:
+            if time.monotonic() - started > 660:
+                break
+            processed += 1
+            if member.bot or member.id == guild.owner_id or member.top_role >= me.top_role:
+                counts["권한·봇 제외"] += 1
+                continue
+            base, target, prefix = role_nickname(member, excluded, history.get(member.id))
+            if target is not None and len(target) > 32:
+                counts["길이 초과"] += 1
+                continue
+            if target == member.nick:
+                counts["동일"] += 1
+                continue
+            try:
+                # discord.py handles Discord's rate limits; do not bypass them.
+                await asyncio.wait_for(member.edit(nick=target, reason=f"역할닉설정: {interaction.user.id}"), timeout=60)
+            except (discord.HTTPException, asyncio.TimeoutError):
+                counts["실패"] += 1
+                continue
+            with closing(nickname_database()) as db, db:
+                db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild.id, member.id, base, target, prefix))
+            counts["변경"] += 1
+            await asyncio.sleep(0.5)
+        result = "역할 닉네임 처리 결과\n" + " / ".join(f"{key}: {value}명" for key, value in counts.items())
+        if processed < len(members):
+            result += f"\n시간 제한으로 {len(members) - processed}명은 미처리했습니다. 다시 실행하면 이어서 적용됩니다."
+        result += "\n32자를 넘는 닉네임은 자르지 않고 건너뜁니다. 역할이 없으면 이 기능이 붙인 접두사만 제거합니다."
+        await interaction.edit_original_response(content=result, allowed_mentions=discord.AllowedMentions.none())
+
+
 bot.tree.add_command(meeting_group)
 bot.tree.add_command(group)
 bot.tree.add_command(admin_group)
@@ -1699,4 +1814,3 @@ if __name__ == "__main__":
     if not token or token == "붙여넣을_봇_토큰":
         raise RuntimeError(f"{ENVIRONMENT_PATH} 파일에 DISCORD_TOKEN을 설정해 주세요.")
     bot.run(token)
-
