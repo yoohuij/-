@@ -1698,11 +1698,13 @@ def nickname_database():
     connection.execute("CREATE TABLE IF NOT EXISTS nickname_excluded_roles (guild_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id, role_id))")
     connection.execute("CREATE TABLE IF NOT EXISTS nickname_history (guild_id INTEGER, user_id INTEGER, base TEXT, applied TEXT, prefix TEXT, PRIMARY KEY(guild_id, user_id))")
     connection.execute("CREATE TABLE IF NOT EXISTS nickname_auto (guild_id INTEGER PRIMARY KEY)")
+    connection.execute("CREATE TABLE IF NOT EXISTS nickname_prefixes (guild_id INTEGER, user_id INTEGER, prefix TEXT, PRIMARY KEY(guild_id,user_id,prefix))")
+    connection.execute("INSERT OR IGNORE INTO nickname_prefixes SELECT guild_id,user_id,prefix FROM nickname_history WHERE prefix IS NOT NULL AND prefix != ''")
     connection.commit()
     return connection
 
 
-def role_nickname(member, excluded, history):
+def role_nickname(member, excluded, history, saved_prefixes=()):
     """Only remove a prefix we previously applied; preserve manually written names."""
     role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
     base = member.nick
@@ -1710,11 +1712,30 @@ def role_nickname(member, excluded, history):
         old_base, applied, prefix = history
         if base == applied:
             base = old_base
-        elif base and prefix and base.startswith(prefix):
-            base = base[len(prefix):] or None
-    prefix = f"『{role.name} 』" if role else ""
+        else:
+            # Remember every prefix applied to THIS member, including renamed/deleted roles.
+            # Never remove arbitrary brackets or another member's role-like personal nickname.
+            known = sorted({p for p in (*saved_prefixes, prefix) if p}, key=len, reverse=True)
+            while base and base != old_base:
+                matched = next((p for p in known if base.startswith(p)), None)
+                if matched is None:
+                    break
+                base = base[len(matched):] or None
+    prefix = f"『 {role.name} 』" if role else ""
     target = prefix + (base or member.global_name or member.name) if role else base
     return base, target, prefix
+
+
+def saved_nickname_prefixes(guild_id, user_id):
+    with closing(nickname_database()) as db:
+        return [r[0] for r in db.execute("SELECT prefix FROM nickname_prefixes WHERE guild_id=? AND user_id=?", (guild_id,user_id))]
+
+
+def save_nickname_history(guild_id, user_id, base, target, prefix):
+    with closing(nickname_database()) as db, db:
+        if prefix:
+            db.execute("INSERT OR IGNORE INTO nickname_prefixes VALUES (?,?,?)", (guild_id,user_id,prefix))
+        db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild_id,user_id,base,target,prefix))
 
 
 def nickname_auto_enabled(guild_id):
@@ -1737,7 +1758,7 @@ async def run_nickname_updates(guild):
                 with closing(nickname_database()) as db:
                     excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
                     history = db.execute("SELECT base,applied,prefix FROM nickname_history WHERE guild_id=? AND user_id=?", (guild.id, user_id)).fetchone()
-                base, target, prefix = role_nickname(member, excluded, history)
+                base, target, prefix = role_nickname(member, excluded, history, saved_nickname_prefixes(guild.id,user_id))
                 if target == member.nick or (target is not None and len(target) > 32):
                     continue
                 try:
@@ -1745,8 +1766,7 @@ async def run_nickname_updates(guild):
                 except discord.HTTPException:
                     logging.getLogger(__name__).warning("자동 닉네임 변경 실패: guild=%s user=%s", guild.id, user_id)
                     continue
-                with closing(nickname_database()) as db, db:
-                    db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild.id, user_id, base, target, prefix))
+                save_nickname_history(guild.id,user_id,base,target,prefix)
             await asyncio.sleep(0.5)
     except Exception:
         logging.getLogger(__name__).exception("자동 닉네임 작업 오류: guild=%s", guild.id)
@@ -1858,7 +1878,7 @@ async def apply_role_nicknames(interaction: discord.Interaction):
             if member.bot or member.id == guild.owner_id or member.top_role >= me.top_role:
                 counts["권한·봇 제외"] += 1
                 continue
-            base, target, prefix = role_nickname(member, excluded, history.get(member.id))
+            base, target, prefix = role_nickname(member, excluded, history.get(member.id), saved_nickname_prefixes(guild.id,member.id))
             if target is not None and len(target) > 32:
                 counts["길이 초과"] += 1
                 continue
@@ -1871,8 +1891,7 @@ async def apply_role_nicknames(interaction: discord.Interaction):
             except (discord.HTTPException, asyncio.TimeoutError):
                 counts["실패"] += 1
                 continue
-            with closing(nickname_database()) as db, db:
-                db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild.id, member.id, base, target, prefix))
+            save_nickname_history(guild.id,member.id,base,target,prefix)
             counts["변경"] += 1
             await asyncio.sleep(0.5)
         result = "자동 갱신을 켰습니다. 역할 변경 시 닉네임이 갱신되며 재시작 후에도 유지됩니다.\n" + " / ".join(f"{key}: {value}명" for key, value in counts.items())
