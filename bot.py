@@ -1689,12 +1689,15 @@ async def end_meeting(interaction: discord.Interaction) -> None:
 
 
 nickname_locks: dict[int, asyncio.Lock] = {}
+nickname_pending: dict[int, set[int]] = {}
+nickname_workers: dict[int, asyncio.Task] = {}
 
 
 def nickname_database():
     connection = database()
     connection.execute("CREATE TABLE IF NOT EXISTS nickname_excluded_roles (guild_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id, role_id))")
     connection.execute("CREATE TABLE IF NOT EXISTS nickname_history (guild_id INTEGER, user_id INTEGER, base TEXT, applied TEXT, prefix TEXT, PRIMARY KEY(guild_id, user_id))")
+    connection.execute("CREATE TABLE IF NOT EXISTS nickname_auto (guild_id INTEGER PRIMARY KEY)")
     connection.commit()
     return connection
 
@@ -1712,6 +1715,81 @@ def role_nickname(member, excluded, history):
     prefix = f"『{role.name} 』" if role else ""
     target = prefix + (base or member.global_name or member.name) if role else base
     return base, target, prefix
+
+
+def nickname_auto_enabled(guild_id):
+    with closing(nickname_database()) as db:
+        return db.execute("SELECT 1 FROM nickname_auto WHERE guild_id=?", (guild_id,)).fetchone() is not None
+
+
+async def run_nickname_updates(guild):
+    import logging
+    pending = nickname_pending.setdefault(guild.id, set())
+    try:
+        while pending:
+            user_id = pending.pop()
+            async with nickname_locks.setdefault(guild.id, asyncio.Lock()):
+                # Read current cache after the lock, not the stale event snapshot.
+                member, me = guild.get_member(user_id), guild.me
+                if (member is None or me is None or member.bot or member.id == guild.owner_id
+                    or not me.guild_permissions.manage_nicknames or member.top_role >= me.top_role):
+                    continue
+                with closing(nickname_database()) as db:
+                    excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
+                    history = db.execute("SELECT base,applied,prefix FROM nickname_history WHERE guild_id=? AND user_id=?", (guild.id, user_id)).fetchone()
+                base, target, prefix = role_nickname(member, excluded, history)
+                if target == member.nick or (target is not None and len(target) > 32):
+                    continue
+                try:
+                    await member.edit(nick=target, reason="역할 변경에 따른 자동 닉네임 갱신")
+                except discord.HTTPException:
+                    logging.getLogger(__name__).warning("자동 닉네임 변경 실패: guild=%s user=%s", guild.id, user_id)
+                    continue
+                with closing(nickname_database()) as db, db:
+                    db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild.id, user_id, base, target, prefix))
+            await asyncio.sleep(0.5)
+    except Exception:
+        logging.getLogger(__name__).exception("자동 닉네임 작업 오류: guild=%s", guild.id)
+    finally:
+        nickname_workers.pop(guild.id, None)
+
+
+def queue_nickname_updates(guild, members):
+    if not nickname_auto_enabled(guild.id):
+        return
+    nickname_pending.setdefault(guild.id, set()).update(m.id for m in members if not m.bot)
+    if guild.id not in nickname_workers:
+        nickname_workers[guild.id] = asyncio.create_task(run_nickname_updates(guild))
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Nickname-only updates include this bot's own edits: never loop on those.
+    if {r.id for r in before.roles} != {r.id for r in after.roles}:
+        queue_nickname_updates(after.guild, [after])
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    queue_nickname_updates(member.guild, [member])
+
+
+@bot.event
+async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    if before.name != after.name or before.position != after.position:
+        queue_nickname_updates(after.guild, after.guild.members)
+
+
+@bot.event
+async def on_guild_role_delete(role: discord.Role):
+    queue_nickname_updates(role.guild, role.guild.members)
+
+
+@bot.event
+async def on_ready():
+    # Reconcile changes that happened while offline; no repeated API calls for matching nicknames.
+    for guild in bot.guilds:
+        queue_nickname_updates(guild, guild.members)
 
 
 @bot.tree.command(name="역할예외설정", description="닉네임에서 제외할 역할 목록을 교체합니다. 모두 비우면 초기화합니다.")
@@ -1738,11 +1816,12 @@ async def nickname_exceptions(interaction: discord.Interaction,
         db.executemany("INSERT INTO nickname_excluded_roles VALUES (?,?)", [(interaction.guild.id, rid) for rid in roles])
     await interaction.response.send_message(
         "역할 닉네임 예외 목록을 교체했습니다: " + (", ".join(r.mention for r in roles.values()) or "없음")
-        + "\n/역할닉설정을 실행하면 적용됩니다. 기존 DM·인원 예외 설정과는 별개입니다.",
+        + "\n자동 갱신이 켜져 있으면 바로 반영됩니다. 처음에는 /역할닉설정을 실행해 주세요.",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    queue_nickname_updates(interaction.guild, interaction.guild.members)
 
 
-@bot.tree.command(name="역할닉설정", description="서버 인원의 닉네임 앞에 예외를 제외한 최상위 역할명을 붙입니다.")
+@bot.tree.command(name="역할닉설정", description="최상위 역할 닉네임을 적용하고 역할 변경 시 자동 갱신을 켭니다.")
 @app_commands.guild_only()
 async def apply_role_nicknames(interaction: discord.Interaction):
     if not is_owner(interaction):
@@ -1759,10 +1838,12 @@ async def apply_role_nicknames(interaction: discord.Interaction):
         return
     await interaction.response.defer(ephemeral=True)
     async with lock:
+        with closing(nickname_database()) as db, db:
+            db.execute("INSERT OR IGNORE INTO nickname_auto VALUES (?)", (guild.id,))
         try:
             members = await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
         except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException):
-            await interaction.edit_original_response(content="전체 인원을 불러오지 못했습니다. Server Members Intent 설정을 확인해 주세요.")
+            await interaction.edit_original_response(content="자동 갱신은 켰지만 전체 인원을 불러오지 못했습니다. Server Members Intent 확인 후 다시 실행해 주세요.")
             return
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
@@ -1794,7 +1875,7 @@ async def apply_role_nicknames(interaction: discord.Interaction):
                 db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild.id, member.id, base, target, prefix))
             counts["변경"] += 1
             await asyncio.sleep(0.5)
-        result = "역할 닉네임 처리 결과\n" + " / ".join(f"{key}: {value}명" for key, value in counts.items())
+        result = "자동 갱신을 켰습니다. 역할 변경 시 닉네임이 갱신되며 재시작 후에도 유지됩니다.\n" + " / ".join(f"{key}: {value}명" for key, value in counts.items())
         if processed < len(members):
             result += f"\n시간 제한으로 {len(members) - processed}명은 미처리했습니다. 다시 실행하면 이어서 적용됩니다."
         result += "\n32자를 넘는 닉네임은 자르지 않고 건너뜁니다. 역할이 없으면 이 기능이 붙인 접두사만 제거합니다."
