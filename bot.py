@@ -1704,8 +1704,34 @@ def nickname_database():
     return connection
 
 
+def clean_nickname_base(value):
+    """Leading role blocks (including nested legacy blocks) are not personal names."""
+    value = (value or "").strip()
+    while value.startswith(("『", "』")):
+        if value.startswith("』"):
+            value = value[1:].lstrip()
+            continue
+        depth, end = 0, None
+        for index, char in enumerate(value):
+            depth += (char == "『") - (char == "』")
+            if depth == 0:
+                end = index + 1
+                break
+        if end is None:
+            break
+        value = value[end:].lstrip()
+    return value.replace("『", "").replace("』", "").strip()
+
+
+def nickname_role_prefix(role):
+    if role is None:
+        return ""
+    name = role.name.replace("『", "").replace("』", "").strip()
+    return f"『 {name} 』" if name else ""
+
+
 def role_nickname(member, excluded, history, saved_prefixes=()):
-    """Only remove a prefix we previously applied; preserve manually written names."""
+    """Rebuild exactly one role block; repair legacy duplicated bases too."""
     role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
     base = member.nick
     if history:
@@ -1721,8 +1747,12 @@ def role_nickname(member, excluded, history, saved_prefixes=()):
                 if matched is None:
                     break
                 base = base[len(matched):] or None
-    prefix = f"『 {role.name} 』" if role else ""
-    target = prefix + (base or member.global_name or member.name) if role else base
+    base = clean_nickname_base(base) if base is not None else None
+    prefix = nickname_role_prefix(role)
+    fallback = clean_nickname_base(member.global_name) or clean_nickname_base(member.name) or str(member.id)
+    if base == "":
+        base = fallback
+    target = prefix + (base or fallback) if prefix else base
     return base, target, prefix
 
 
@@ -1742,7 +1772,7 @@ def save_nickname_history(guild_id, user_id, base, target, prefix):
 @app_commands.guild_only()
 @app_commands.describe(닉네임="역할명 없이 새 닉네임만 입력해 주세요")
 async def change_own_nickname(interaction: discord.Interaction, 닉네임: app_commands.Range[str, 1, 32]):
-    base = 닉네임.strip()
+    base = clean_nickname_base(닉네임)
     if not base or any(ord(c) < 32 or ord(c) == 127 for c in base):
         await interaction.response.send_message("공백이나 줄바꿈만 있는 닉네임은 사용할 수 없습니다.", ephemeral=True)
         return
@@ -1763,7 +1793,7 @@ async def change_own_nickname(interaction: discord.Interaction, 닉네임: app_c
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
         role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
-        prefix = f"『 {role.name} 』" if role else ""
+        prefix = nickname_role_prefix(role)
         target = prefix + base
         if len(target) > 32:
             await interaction.edit_original_response(content=f"역할명 포함 최대 32자입니다. 닉네임을 {max(0, 32-len(prefix))}자 이내로 입력해 주세요.")
