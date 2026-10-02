@@ -631,6 +631,7 @@ class MemberResultView(discord.ui.View):
         count_label: str,
         empty_message: str,
         mention_message: str,
+        refresh_members=None,
     ) -> None:
         super().__init__(timeout=900)
         self.owner_id = owner_id
@@ -639,9 +640,14 @@ class MemberResultView(discord.ui.View):
         self.title = title
         self.count_label = count_label
         self.mention_message = mention_message
+        self.refresh_members = refresh_members
+        self.empty_message = empty_message
+        self.refresh_lock = asyncio.Lock()
         self.pages = make_member_pages(members, empty_message)
         self.page = 0
         self.mention.label = f"{count_label} 멘션"
+        if refresh_members is None:
+            self.remove_item(self.refresh)
         self.update_buttons()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -677,7 +683,42 @@ class MemberResultView(discord.ui.View):
 
     @discord.ui.button(label="대상자 멘션", style=discord.ButtonStyle.danger)
     async def mention(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if self.refresh_lock.locked():
+            await interaction.response.send_message("조회 중입니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True)
+        async with self.refresh_lock:
+            if not await self.reload_members(interaction):
+                return
+            await self.send_mentions(interaction)
+
+    async def reload_members(self, interaction):
+        if self.refresh_members is None:
+            return True
+        try:
+            members, total = await asyncio.wait_for(self.refresh_members(), timeout=90)
+        except (discord.HTTPException, ValueError, asyncio.TimeoutError):
+            await interaction.followup.send("최신 반응을 확인하지 못했습니다. 잘못된 멘션을 막기 위해 전송하지 않습니다. 메시지와 봇 권한을 확인해 주세요.", ephemeral=True)
+            return False
+        self.members, self.total_members = members, total
+        self.pages = make_member_pages(members, self.empty_message)
+        self.page = 0
+        self.update_buttons()
+        if interaction.message is not None:
+            await interaction.message.edit(embed=self.embed(), view=self, allowed_mentions=discord.AllowedMentions.none())
+        return True
+
+    @discord.ui.button(label="새로고침", style=discord.ButtonStyle.primary)
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if self.refresh_lock.locked():
+            await interaction.response.send_message("조회 중입니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with self.refresh_lock:
+            if await self.reload_members(interaction):
+                await interaction.followup.send("현재 반응과 회의방 참여 상태로 갱신했습니다.", ephemeral=True)
+
+    async def send_mentions(self, interaction):
         exempt_ids = get_notice_exemptions(interaction.guild.id)
         self.members = [member for member in self.members if member.id not in exempt_ids]
         chunks: list[str] = []
@@ -881,7 +922,6 @@ class AttendanceBot(discord.Client):
 
 
 bot = AttendanceBot()
-group = app_commands.Group(name="미반응자", description="반응하지 않은 일반 유저를 확인합니다.")
 admin_group = app_commands.Group(name="관리자", description="공지용 봇 관리자 권한을 관리합니다.")
 
 
@@ -1127,7 +1167,28 @@ async def check_meeting_non_participants(interaction: discord.Interaction) -> No
     await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="잠수확인", description="회의방 참여자 중 메시지 반응을 누르지 않은 사람을 확인합니다.")
+async def collect_reacted_ids(message):
+    reacted_ids: set[int] = set()
+    for reaction in message.reactions:
+        for kind in (discord.ReactionType.normal, discord.ReactionType.burst):
+            async for user in reaction.users(limit=None, type=kind):
+                if not user.bot:
+                    reacted_ids.add(user.id)
+    return reacted_ids
+
+
+async def get_idle_members(guild, channel, message_id):
+    meeting_channel_id = get_meeting_settings(guild.id).meeting_channel_id
+    if meeting_channel_id is None:
+        raise ValueError("회의방이 등록되지 않았습니다.")
+    # Always fetch again: an earlier result must not be reused for a mention.
+    message = await channel.fetch_message(message_id)
+    reacted_ids = await collect_reacted_ids(message)
+    members = await get_meeting_members(guild, meeting_channel_id)
+    return [m for m in members if m.id not in reacted_ids], len(members)
+
+
+@bot.tree.command(name="잠수확인", description="회의방 참여자 중 메시지에 일반·슈퍼 반응을 달지 않은 사람을 확인합니다.")
 @app_commands.describe(메시지_id="반응을 확인할 메시지 ID")
 async def check_idle_members(interaction: discord.Interaction, 메시지_id: str) -> None:
     if interaction.guild is None or interaction.channel is None:
@@ -1141,89 +1202,38 @@ async def check_idle_members(interaction: discord.Interaction, 메시지_id: str
         await interaction.response.send_message("먼저 `/회의방등록`으로 회의방을 지정해 주세요.", ephemeral=True)
         return
     try:
-        message = await interaction.channel.fetch_message(int(메시지_id))
-    except (ValueError, discord.NotFound):
-        await interaction.response.send_message("현재 채널에서 해당 메시지 ID를 찾지 못했습니다.", ephemeral=True)
-        return
-    except discord.HTTPException:
-        await interaction.response.send_message("메시지를 읽지 못했습니다. 봇 권한을 확인해 주세요.", ephemeral=True)
+        message_id = int(메시지_id)
+        if message_id <= 0:
+            raise ValueError
+    except ValueError:
+        await interaction.response.send_message("올바른 메시지 ID를 입력해 주세요.", ephemeral=True)
         return
     await interaction.response.defer()
-    reacted_ids: set[int] = set()
-    for reaction in message.reactions:
-        async for user in reaction.users(limit=None):
-            if not user.bot:
-                reacted_ids.add(user.id)
-    meeting_members = await get_meeting_members(interaction.guild, meeting_channel_id)
-    idle_members = [member for member in meeting_members if member.id not in reacted_ids]
+
+    async def refresh_members():
+        return await get_idle_members(interaction.guild, interaction.channel, message_id)
+
+    try:
+        idle_members, total = await asyncio.wait_for(refresh_members(), timeout=90)
+    except discord.NotFound:
+        await interaction.followup.send("현재 채널에서 해당 메시지나 반응을 찾지 못했습니다. 메시지가 있는 채널에서 다시 실행해 주세요.", ephemeral=True)
+        return
+    except (discord.HTTPException, ValueError, asyncio.TimeoutError):
+        await interaction.followup.send("메시지·반응·인원 조회를 완료하지 못했습니다. 일부 결과로 잠수자를 판정하지 않습니다. 권한 확인 후 다시 시도해 주세요.", ephemeral=True)
+        return
     view = MemberResultView(
         interaction.user.id,
         idle_members,
-        len(meeting_members),
+        total,
         "회의방 잠수 확인",
         "미반응자",
         "현재 회의방에 참여한 모든 사람이 메시지에 반응했습니다.",
         "반응 확인 부탁드립니다.",
+        refresh_members=refresh_members,
     )
     await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
-@bot.tree.command(name="인원체크", description="현재 채널의 메시지를 반응 확인 대상으로 등록합니다.")
-@app_commands.describe(message_id="반응을 확인할 메시지 ID", emoji="반응으로 인정할 이모지 하나")
-async def set_check_target(interaction: discord.Interaction, message_id: str, emoji: str) -> None:
-    if interaction.guild is None or interaction.channel is None:
-        await interaction.response.send_message("서버 채널에서만 사용할 수 있습니다.", ephemeral=True)
-        return
-    if not can_manage(interaction):
-        await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
-        return
-    try:
-        numeric_message_id = int(message_id)
-        target = CheckTarget(interaction.guild.id, interaction.channel.id, numeric_message_id, emoji)
-        message = await fetch_target_message(bot, target)
-    except (ValueError, discord.NotFound):
-        await interaction.response.send_message("현재 채널에서 해당 메시지 ID를 찾지 못했습니다.", ephemeral=True)
-        return
-    except discord.HTTPException:
-        await interaction.response.send_message("메시지를 읽지 못했습니다. 봇 권한을 확인해 주세요.", ephemeral=True)
-        return
-    save_target(target)
-    await interaction.response.send_message(
-        f"인원 체크 메시지를 등록했습니다: [메시지 보기]({message.jump_url})\n인정 기준: `{emoji}` 반응",
-        ephemeral=True,
-        allowed_mentions=discord.AllowedMentions.none(),
-    )
-
-
-@group.command(name="확인", description="등록된 메시지의 미반응자를 확인합니다.")
-async def check_non_responders(interaction: discord.Interaction) -> None:
-    if interaction.guild is None:
-        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
-        return
-    if not can_manage(interaction):
-        await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
-        return
-    target = get_target(interaction.guild.id)
-    if target is None:
-        await interaction.response.send_message("먼저 `/인원체크`로 대상 메시지를 등록해 주세요.", ephemeral=True)
-        return
-    await interaction.response.defer()
-    try:
-        message, members, total_members = await get_non_responders(bot, interaction.guild, target)
-    except discord.NotFound:
-        await interaction.followup.send("등록된 메시지 또는 채널을 찾지 못했습니다. 다시 등록해 주세요.", ephemeral=True)
-        return
-    except ValueError as error:
-        await interaction.followup.send(str(error), ephemeral=True)
-        return
-    except discord.Forbidden:
-        await interaction.followup.send("메시지·반응·멤버 목록을 볼 권한이 없습니다.", ephemeral=True)
-        return
-    except discord.HTTPException as error:
-        await interaction.followup.send(f"조회 중 오류가 발생했습니다: {error}", ephemeral=True)
-        return
-    view = ResultView(bot, interaction.user.id, interaction.guild, target, members, total_members, message)
-    await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
 class NoticeModal(discord.ui.Modal, title="공지 작성"):
@@ -1972,7 +1982,6 @@ async def apply_role_nicknames(interaction: discord.Interaction):
 
 
 bot.tree.add_command(meeting_group)
-bot.tree.add_command(group)
 bot.tree.add_command(admin_group)
 
 import donations
