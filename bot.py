@@ -1727,7 +1727,7 @@ def nickname_role_prefix(role):
     if role is None:
         return ""
     name = role.name.replace("『", "").replace("』", "").strip()
-    return f"『 {name} 』" if name else ""
+    return f"『 {name} 』 " if name else ""
 
 
 def role_nickname(member, excluded, history, saved_prefixes=()):
