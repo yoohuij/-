@@ -1738,6 +1738,46 @@ def save_nickname_history(guild_id, user_id, base, target, prefix):
         db.execute("INSERT INTO nickname_history VALUES (?,?,?,?,?) ON CONFLICT(guild_id,user_id) DO UPDATE SET base=excluded.base,applied=excluded.applied,prefix=excluded.prefix", (guild_id,user_id,base,target,prefix))
 
 
+@bot.tree.command(name="닉변", description="역할 접두사를 유지하면서 자신의 닉네임만 변경합니다.")
+@app_commands.guild_only()
+@app_commands.describe(닉네임="역할명 없이 새 닉네임만 입력해 주세요")
+async def change_own_nickname(interaction: discord.Interaction, 닉네임: app_commands.Range[str, 1, 32]):
+    base = 닉네임.strip()
+    if not base or any(ord(c) < 32 or ord(c) == 127 for c in base):
+        await interaction.response.send_message("공백이나 줄바꿈만 있는 닉네임은 사용할 수 없습니다.", ephemeral=True)
+        return
+    guild = interaction.guild
+    lock = nickname_locks.setdefault(guild.id, asyncio.Lock())
+    if lock.locked():
+        await interaction.response.send_message("서버 닉네임을 갱신 중입니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    async with lock:
+        member, me = guild.get_member(interaction.user.id), guild.me
+        if member is None or me is None or not me.guild_permissions.manage_nicknames:
+            await interaction.edit_original_response(content="서버 인원을 확인하지 못했거나 봇에 닉네임 관리 권한이 없습니다.")
+            return
+        if member.id == guild.owner_id or member.top_role >= me.top_role:
+            await interaction.edit_original_response(content="Discord 권한 제한으로 서버 소유자 또는 봇 이상의 역할을 가진 분의 닉네임은 변경할 수 없습니다.")
+            return
+        with closing(nickname_database()) as db:
+            excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
+        role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
+        prefix = f"『 {role.name} 』" if role else ""
+        target = prefix + base
+        if len(target) > 32:
+            await interaction.edit_original_response(content=f"역할명 포함 최대 32자입니다. 닉네임을 {max(0, 32-len(prefix))}자 이내로 입력해 주세요.")
+            return
+        try:
+            if target != member.nick:
+                await member.edit(nick=target, reason=f"본인 닉변 요청: {member.id}")
+        except discord.HTTPException:
+            await interaction.edit_original_response(content="닉네임을 변경하지 못했습니다. 봇 권한과 입력한 닉네임을 확인해 주세요.")
+            return
+        save_nickname_history(guild.id, member.id, base, target, prefix)
+        await interaction.edit_original_response(content=f"닉네임을 변경했습니다: {discord.utils.escape_markdown(target)}", allowed_mentions=discord.AllowedMentions.none())
+
+
 def nickname_auto_enabled(guild_id):
     with closing(nickname_database()) as db:
         return db.execute("SELECT 1 FROM nickname_auto WHERE guild_id=?", (guild_id,)).fetchone() is not None
