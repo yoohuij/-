@@ -46,6 +46,8 @@ class DonationStore:
                 db.execute('CREATE TABLE IF NOT EXISTS donation_ranking_pages (channel_id INTEGER NOT NULL, page INTEGER NOT NULL, message_id INTEGER NOT NULL, PRIMARY KEY(channel_id,page))')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_adjustments (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, amount INTEGER NOT NULL CHECK(amount < 0), recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_corrections (interaction_id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL, operation TEXT NOT NULL, recorded_by INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_rank_roles (guild_id INTEGER PRIMARY KEY, first_role INTEGER, second_role INTEGER, third_role INTEGER)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_role_assignments (guild_id INTEGER, user_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id,user_id,role_id))')
                 yield db
         finally:
             db.close()
@@ -142,6 +144,66 @@ class DonationFeature:
         self.bot = bot
         self.store = DonationStore(database)
         self.lock = asyncio.Lock()
+
+    def role_guilds(self):
+        with self.store.connection() as db:
+            return [r[0] for r in db.execute('SELECT guild_id FROM donation_rank_roles')]
+
+    async def update_rank_roles(self, guild_id):
+        with self.store.connection() as db:
+            config = db.execute('SELECT first_role,second_role,third_role FROM donation_rank_roles WHERE guild_id=?', (guild_id,)).fetchone()
+            tracked = set(db.execute('SELECT user_id,role_id FROM donation_role_assignments WHERE guild_id=?', (guild_id,)))
+        if not config:
+            return
+        guild = self.bot.get_guild(guild_id)
+        if guild is None or guild.me is None or not guild.me.guild_permissions.manage_roles:
+            raise ValueError('봇 역할 관리 권한을 확인해 주세요.')
+        roles = [guild.get_role(rid) for rid in config]
+        if any(r is None or r.is_default() or r.managed or r >= guild.me.top_role for r in roles):
+            raise ValueError('랭킹 역할이 없거나 봇보다 높습니다.')
+        # Use the same global ordering as the ranking message, including its tie-break rule.
+        desired = {uid: config[index] for index, (uid, _) in enumerate(self.store.totals()[:3])}
+        members = [m async for m in guild.fetch_members(limit=None)]
+        present = {m.id for m in members}
+        failed = False
+        for member in members:
+            held = {r.id for r in member.roles}
+            wanted = desired.get(member.id) if not member.bot else None
+            old = (held & set(config)) | {rid for uid,rid in tracked if uid == member.id}
+            removal_failed = False
+            for rid in old - {wanted}:
+                role = guild.get_role(rid)
+                try:
+                    if role is not None and rid in held:
+                        await member.remove_roles(role, reason='후원 순위 변경')
+                    with self.store.connection() as db:
+                        db.execute('DELETE FROM donation_role_assignments WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,member.id,rid))
+                except discord.HTTPException:
+                    failed = removal_failed = True
+            if wanted is not None and not removal_failed:
+                # Persist the intended assignment before HTTP so restart can reconcile a lost reply.
+                with self.store.connection() as db:
+                    db.execute('INSERT OR IGNORE INTO donation_role_assignments VALUES (?,?,?)', (guild_id,member.id,wanted))
+                try:
+                    if wanted not in held:
+                        await member.add_roles(guild.get_role(wanted), reason='후원 상위 3위 역할 지급')
+                except discord.HTTPException:
+                    failed = True
+        with self.store.connection() as db:
+            for uid,rid in tracked:
+                if uid not in present:
+                    db.execute('DELETE FROM donation_role_assignments WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,uid,rid))
+        if failed:
+            raise ValueError('일부 역할 적용 실패: 역할 권한 확인 후 /랭크역할을 다시 실행해 주세요.')
+
+    async def sync_all_rank_roles(self):
+        problems = []
+        for guild_id in self.role_guilds():
+            try:
+                await self.update_rank_roles(guild_id)
+            except (ValueError, discord.HTTPException):
+                problems.append(f'후원 역할 갱신 실패 (서버 {guild_id}): /랭크역할로 재시도해 주세요.')
+        return problems
 
     async def owner_check(self, interaction):
         if interaction.guild and interaction.user.id == self.bot.application_owner_id:
@@ -244,6 +306,29 @@ class DonationTemplateModal(discord.ui.Modal):
 def install(bot, database):
     feature = DonationFeature(bot, database)
 
+    @bot.tree.command(name='랭크역할', description='후원 1·2·3위 전용 역할을 지정합니다.')
+    @app_commands.guild_only()
+    @app_commands.rename(first='1위역할', second='2위역할', third='3위역할')
+    async def rank_roles(interaction: discord.Interaction, first: discord.Role, second: discord.Role, third: discord.Role):
+        if not await feature.owner_check(interaction):
+            return
+        roles = (first,second,third)
+        me = interaction.guild.me
+        if (len({r.id for r in roles}) != 3 or me is None or not me.guild_permissions.manage_roles
+            or any(r.guild.id != interaction.guild.id or r.is_default() or r.managed or r >= me.top_role for r in roles)):
+            await interaction.response.send_message('서로 다른 일반 역할 3개를 선택해 주세요. 봇에 역할 관리 권한이 필요하며, 선택한 역할은 봇 역할보다 아래여야 합니다.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with feature.lock:
+            with feature.store.connection() as db:
+                db.execute('INSERT INTO donation_rank_roles VALUES (?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET first_role=excluded.first_role,second_role=excluded.second_role,third_role=excluded.third_role', (interaction.guild.id,first.id,second.id,third.id))
+            try:
+                await feature.update_rank_roles(interaction.guild.id)
+            except (ValueError, discord.HTTPException):
+                await interaction.followup.send('설정은 저장했지만 일부 역할을 적용하지 못했습니다. 봇 역할 순서·권한을 확인하고 /랭크역할을 다시 실행해 주세요.', ephemeral=True)
+                return
+        await interaction.followup.send('후원 1·2·3위 전용 역할을 저장하고 적용했습니다. 후원 기록·차감·삭제 시 자동 갱신됩니다.', ephemeral=True)
+
     async def register_channel(interaction, channel, ranking):
         if not await feature.owner_check(interaction):
             return
@@ -308,7 +393,7 @@ def install(bot, database):
             if not feature.store.record(interaction.id, 유저.id, 금액, interaction.guild.id, interaction.user.id):
                 await interaction.followup.send('이미 처리한 후원 요청입니다. 중복 합산하지 않았습니다.', ephemeral=True)
                 return
-            problems = []
+            problems = await feature.sync_all_rank_roles()
             try:
                 total = dict(feature.store.totals()).get(유저.id, 0)
                 await channel.send(render(config['notice_template'], 유저.id, 금액, usermoney=total),
@@ -354,6 +439,9 @@ def install(bot, database):
                     failures += 1
             if failures:
                 result += f'\n기록은 반영되었지만 {failures}개 서버의 랭킹 갱신에 실패했습니다. 같은 요청을 새로 실행하지 말고 `/후원랭킹메시지`로 갱신해 주세요.'
+            role_problems = await feature.sync_all_rank_roles()
+            if role_problems:
+                result += '\n' + '\n'.join(role_problems[:10])
             await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @bot.tree.command(name='후원기록차감', description='봇 소유자 전용: 지정한 유저의 전체 누적 후원금액을 차감합니다.')
@@ -367,4 +455,3 @@ def install(bot, database):
         await correct_record(interaction, 유저)
 
     return feature
-
