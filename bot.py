@@ -298,7 +298,7 @@ def get_pending_request_message_ids() -> list[tuple[int, int]]:
 
 
 def get_notice_exemptions(guild_id: int) -> set[int]:
-    with database() as connection:
+    with closing(database()) as connection:
         rows = connection.execute(
             "SELECT user_id FROM global_exemptions ORDER BY user_id"
         ).fetchall()
@@ -306,7 +306,7 @@ def get_notice_exemptions(guild_id: int) -> set[int]:
 
 
 def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
-    with database() as connection:
+    with closing(database()) as connection, connection:
         if is_exempt:
             connection.execute(
                 "INSERT OR IGNORE INTO global_exemptions (user_id) VALUES (?)",
@@ -1803,7 +1803,7 @@ async def change_own_nickname(interaction: discord.Interaction, 닉네임: app_c
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
         role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
-        prefix = nickname_role_prefix(role)
+        prefix = "" if member.id in get_notice_exemptions(guild.id) else nickname_role_prefix(role)
         target = prefix + base
         if len(target) > 32:
             await interaction.edit_original_response(content=f"역할명 포함 최대 32자입니다. 닉네임을 {max(0, 32-len(prefix))}자 이내로 입력해 주세요.")
@@ -1832,7 +1832,7 @@ async def run_nickname_updates(guild):
             async with nickname_locks.setdefault(guild.id, asyncio.Lock()):
                 # Read current cache after the lock, not the stale event snapshot.
                 member, me = guild.get_member(user_id), guild.me
-                if (member is None or me is None or member.bot or member.id == guild.owner_id
+                if (member is None or me is None or member.bot or member.id in get_notice_exemptions(guild.id) or member.id == guild.owner_id
                     or not me.guild_permissions.manage_nicknames or member.top_role >= me.top_role):
                     continue
                 with closing(nickname_database()) as db:
@@ -1872,6 +1872,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 @bot.event
 async def on_member_join(member: discord.Member):
     queue_nickname_updates(member.guild, [member])
+    if member.guild.id in donation_feature.role_guilds():
+        async with donation_feature.lock:
+            try:
+                await donation_feature.update_rank_roles(member.guild.id)
+            except (ValueError, discord.HTTPException):
+                import logging
+                logging.getLogger(__name__).warning('후원 역할 재입장 갱신 실패: %s', member.guild.id)
 
 
 @bot.event
@@ -1890,6 +1897,11 @@ async def on_ready():
     # Reconcile changes that happened while offline; no repeated API calls for matching nicknames.
     for guild in bot.guilds:
         queue_nickname_updates(guild, guild.members)
+    async with donation_feature.lock:
+        problems = await donation_feature.sync_all_rank_roles()
+        if problems:
+            import logging
+            logging.getLogger(__name__).warning('%s', '\n'.join(problems))
 
 
 @bot.tree.command(name="역할예외설정", description="닉네임에서 제외할 역할 목록을 교체합니다. 모두 비우면 초기화합니다.")
@@ -1948,13 +1960,16 @@ async def apply_role_nicknames(interaction: discord.Interaction):
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
             history = {r[0]: r[1:] for r in db.execute("SELECT user_id,base,applied,prefix FROM nickname_history WHERE guild_id=?", (guild.id,))}
-        counts = {"변경": 0, "동일": 0, "권한·봇 제외": 0, "길이 초과": 0, "실패": 0}
+        counts = {"변경": 0, "동일": 0, "권한·봇 제외": 0, "예외 제외": 0, "길이 초과": 0, "실패": 0}
         started = time.monotonic()
         processed = 0
         for member in members:
             if time.monotonic() - started > 660:
                 break
             processed += 1
+            if member.id in get_notice_exemptions(guild.id):
+                counts["예외 제외"] += 1
+                continue
             if member.bot or member.id == guild.owner_id or member.top_role >= me.top_role:
                 counts["권한·봇 제외"] += 1
                 continue
@@ -1986,6 +2001,12 @@ bot.tree.add_command(admin_group)
 
 import donations
 donation_feature = donations.install(bot, database)
+
+# Discord requires a non-empty description for slash commands and their options.
+for command in bot.tree.walk_commands():
+    command.description = '·'
+    if isinstance(command, app_commands.Command):
+        app_commands.describe(**{p.name: '·' for p in command.parameters})(command)
 
 
 if __name__ == "__main__":
