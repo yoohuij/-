@@ -50,6 +50,8 @@ class DonationStore:
                 db.execute('CREATE TABLE IF NOT EXISTS donation_role_assignments (guild_id INTEGER, user_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id,user_id,role_id))')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_tiers (guild_id INTEGER, amount INTEGER, role_id INTEGER, PRIMARY KEY(guild_id,role_id))')
                 db.execute('CREATE TABLE IF NOT EXISTS donation_tier_assignments (guild_id INTEGER, user_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id,user_id,role_id))')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_supporter_role (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)')
+                db.execute('CREATE TABLE IF NOT EXISTS donation_supporter_assignments (guild_id INTEGER, user_id INTEGER, role_id INTEGER, PRIMARY KEY(guild_id,user_id,role_id))')
                 yield db
         finally:
             db.close()
@@ -149,11 +151,18 @@ class DonationFeature:
 
     def role_guilds(self):
         with self.store.connection() as db:
-            return [r[0] for r in db.execute('SELECT guild_id FROM donation_rank_roles UNION SELECT guild_id FROM donation_tiers UNION SELECT guild_id FROM donation_tier_assignments')]
+            return [r[0] for r in db.execute('SELECT guild_id FROM donation_rank_roles UNION SELECT guild_id FROM donation_tiers UNION SELECT guild_id FROM donation_tier_assignments UNION SELECT guild_id FROM donation_supporter_role UNION SELECT guild_id FROM donation_supporter_assignments')]
+
+    def supporter_role_ids(self, guild_id):
+        with self.store.connection() as db:
+            return {r[0] for r in db.execute('SELECT role_id FROM donation_supporter_role WHERE guild_id=? UNION SELECT role_id FROM donation_supporter_assignments WHERE guild_id=?', (guild_id,guild_id))}
+
+    async def update_supporter_role(self, guild_id):
+        await self.update_tier_roles(guild_id, common=True)
 
     async def update_rank_roles(self, guild_id):
         errors = []
-        for updater in (self._update_rank_roles, self.update_tier_roles):
+        for updater in (self._update_rank_roles, self.update_tier_roles, self.update_supporter_role):
             try:
                 await updater(guild_id)
             except (ValueError, discord.HTTPException) as error:
@@ -161,10 +170,11 @@ class DonationFeature:
         if errors:
             raise ValueError('후원 역할 갱신 실패: ' + ', '.join(errors))
 
-    async def update_tier_roles(self, guild_id):
+    async def update_tier_roles(self, guild_id, *, common=False):
+        assignment_table = 'donation_supporter_assignments' if common else 'donation_tier_assignments'
         with self.store.connection() as db:
-            tiers = db.execute('SELECT amount,role_id FROM donation_tiers WHERE guild_id=? ORDER BY amount', (guild_id,)).fetchall()
-            tracked = set(db.execute('SELECT user_id,role_id FROM donation_tier_assignments WHERE guild_id=?', (guild_id,)))
+            tiers = db.execute('SELECT 1,role_id FROM donation_supporter_role WHERE guild_id=?' if common else 'SELECT amount,role_id FROM donation_tiers WHERE guild_id=? ORDER BY amount', (guild_id,)).fetchall()
+            tracked = set(db.execute(f'SELECT user_id,role_id FROM {assignment_table} WHERE guild_id=?', (guild_id,)))
         if not tiers and not tracked:
             return
         guild = self.bot.get_guild(guild_id)
@@ -188,12 +198,12 @@ class DonationFeature:
                     if role is not None and rid in held:
                         await member.remove_roles(role, reason='누적 후원 단계 변경')
                     with self.store.connection() as db:
-                        db.execute('DELETE FROM donation_tier_assignments WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,member.id,rid))
+                        db.execute(f'DELETE FROM {assignment_table} WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,member.id,rid))
                 except discord.HTTPException:
                     failed = True
             for rid in wanted:
                 with self.store.connection() as db:
-                    db.execute('INSERT OR IGNORE INTO donation_tier_assignments VALUES (?,?,?)', (guild_id,member.id,rid))
+                    db.execute(f'INSERT OR IGNORE INTO {assignment_table} VALUES (?,?,?)', (guild_id,member.id,rid))
                 try:
                     if rid not in held:
                         await member.add_roles(roles[rid], reason='누적 후원 기준 달성')
@@ -202,7 +212,7 @@ class DonationFeature:
         with self.store.connection() as db:
             for uid,rid in tracked:
                 if uid not in present:
-                    db.execute('DELETE FROM donation_tier_assignments WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,uid,rid))
+                    db.execute(f'DELETE FROM {assignment_table} WHERE guild_id=? AND user_id=? AND role_id=?', (guild_id,uid,rid))
         if failed:
             raise ValueError('일부 후원 역할을 적용하지 못했습니다.')
 
@@ -259,7 +269,7 @@ class DonationFeature:
             try:
                 await self.update_rank_roles(guild_id)
             except (ValueError, discord.HTTPException):
-                problems.append(f'후원 역할 갱신 실패 (서버 {guild_id}): /랭크역할 또는 /후원역할로 재시도해 주세요.')
+                problems.append(f'후원 역할 갱신 실패 (서버 {guild_id}): 해당 /랭크역할·/후원역할·/후원자역할 설정으로 재시도해 주세요.')
         return problems
 
     async def owner_check(self, interaction):
@@ -363,6 +373,32 @@ class DonationTemplateModal(discord.ui.Modal):
 def install(bot, database):
     feature = DonationFeature(bot, database)
 
+    @bot.tree.command(name='후원자역할', description='·')
+    @app_commands.guild_only()
+    async def supporter_role(interaction: discord.Interaction, 역할: discord.Role):
+        if not await feature.owner_check(interaction):
+            return
+        me = interaction.guild.me
+        if (me is None or not me.guild_permissions.manage_roles or 역할.guild.id != interaction.guild.id
+            or 역할.is_default() or 역할.managed or 역할 >= me.top_role):
+            await interaction.response.send_message('봇 역할 아래의 일반 역할을 지정해 주세요. 봇에 역할 관리 권한이 필요합니다.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        async with feature.lock:
+            with feature.store.connection() as db:
+                rank = db.execute('SELECT first_role,second_role,third_role FROM donation_rank_roles WHERE guild_id=?', (interaction.guild.id,)).fetchone() or ()
+                occupied = set(rank) | {r[0] for r in db.execute('SELECT role_id FROM donation_role_assignments WHERE guild_id=? UNION SELECT role_id FROM donation_tiers WHERE guild_id=? UNION SELECT role_id FROM donation_tier_assignments WHERE guild_id=?', (interaction.guild.id,)*3)}
+                if 역할.id in occupied:
+                    await interaction.followup.send('공통 후원자 역할은 랭킹·금액별 후원 역할과 다르게 지정해 주세요.', ephemeral=True)
+                    return
+                db.execute('INSERT INTO donation_supporter_role VALUES (?,?) ON CONFLICT(guild_id) DO UPDATE SET role_id=excluded.role_id', (interaction.guild.id,역할.id))
+            try:
+                await feature.update_supporter_role(interaction.guild.id)
+            except (ValueError,discord.HTTPException):
+                await interaction.followup.send('설정은 저장했지만 일부 지급·회수에 실패했습니다. 권한 확인 후 /후원자역할을 다시 실행해 주세요.', ephemeral=True)
+                return
+        await interaction.followup.send(f'누적 후원액이 1원 이상인 모든 후원자에게 {역할.mention} 역할을 적용했습니다. 이후 기록 변경에도 자동 반영됩니다.', ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
     @bot.tree.command(name='후원역할', description='·')
     @app_commands.guild_only()
     async def tier_roles(interaction: discord.Interaction,
@@ -390,8 +426,8 @@ def install(bot, database):
             with feature.store.connection() as db:
                 rank = db.execute('SELECT first_role,second_role,third_role FROM donation_rank_roles WHERE guild_id=?', (interaction.guild.id,)).fetchone() or ()
                 rank_ids = set(rank) | {r[0] for r in db.execute('SELECT role_id FROM donation_role_assignments WHERE guild_id=?', (interaction.guild.id,))}
-                if rank_ids & {r.id for _,r in pairs}:
-                    await interaction.followup.send('랭킹 역할과 금액별 후원 역할은 서로 다른 역할을 사용해 주세요.', ephemeral=True)
+                if (rank_ids | feature.supporter_role_ids(interaction.guild.id)) & {r.id for _,r in pairs}:
+                    await interaction.followup.send('랭킹·공통·금액별 후원 역할은 서로 다른 역할을 사용해 주세요.', ephemeral=True)
                     return
                 db.execute('DELETE FROM donation_tiers WHERE guild_id=?', (interaction.guild.id,))
                 db.executemany('INSERT INTO donation_tiers VALUES (?,?,?)', [(interaction.guild.id,amount*10_000,role.id) for amount,role in pairs])
@@ -419,8 +455,8 @@ def install(bot, database):
         async with feature.lock:
             with feature.store.connection() as db:
                 tier_ids = {r[0] for r in db.execute('SELECT role_id FROM donation_tiers WHERE guild_id=? UNION SELECT role_id FROM donation_tier_assignments WHERE guild_id=?', (interaction.guild.id,interaction.guild.id))}
-                if tier_ids & {r.id for r in roles}:
-                    await interaction.followup.send('금액별 후원 역할과 랭킹 역할은 서로 다른 역할을 사용해 주세요.', ephemeral=True)
+                if (tier_ids | feature.supporter_role_ids(interaction.guild.id)) & {r.id for r in roles}:
+                    await interaction.followup.send('금액별·공통·랭킹 역할은 서로 다른 역할을 사용해 주세요.', ephemeral=True)
                     return
                 db.execute('INSERT INTO donation_rank_roles VALUES (?,?,?,?) ON CONFLICT(guild_id) DO UPDATE SET first_role=excluded.first_role,second_role=excluded.second_role,third_role=excluded.third_role', (interaction.guild.id,first.id,second.id,third.id))
             try:
