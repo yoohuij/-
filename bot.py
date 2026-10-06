@@ -1904,7 +1904,13 @@ async def on_ready():
             logging.getLogger(__name__).warning('%s', '\n'.join(problems))
 
 
-@bot.tree.command(name="역할예외설정", description="닉네임에서 제외할 역할 목록을 교체합니다. 모두 비우면 초기화합니다.")
+def nickname_exception_ids(guild_id: int) -> list[int]:
+    with closing(nickname_database()) as db:
+        return [row[0] for row in db.execute(
+            "SELECT role_id FROM nickname_excluded_roles WHERE guild_id=? ORDER BY rowid", (guild_id,))]
+
+
+@bot.tree.command(name="역할예외설정", description="닉네임에서 제외할 역할을 누적 추가합니다.")
 @app_commands.guild_only()
 async def nickname_exceptions(interaction: discord.Interaction,
     역할1: discord.Role | None = None, 역할2: discord.Role | None = None,
@@ -1923,12 +1929,63 @@ async def nickname_exceptions(interaction: discord.Interaction,
     if any(r.guild.id != interaction.guild.id for r in roles.values()):
         await interaction.response.send_message("현재 서버의 역할만 선택해 주세요.", ephemeral=True)
         return
+    if not roles:
+        await interaction.response.send_message("추가할 역할을 선택해 주세요. 목록은 /예외역할목록, 제거는 /역할예외제거로 할 수 있습니다.", ephemeral=True)
+        return
     with closing(nickname_database()) as db, db:
-        db.execute("DELETE FROM nickname_excluded_roles WHERE guild_id=?", (interaction.guild.id,))
-        db.executemany("INSERT INTO nickname_excluded_roles VALUES (?,?)", [(interaction.guild.id, rid) for rid in roles])
+        before = db.total_changes
+        db.executemany("INSERT OR IGNORE INTO nickname_excluded_roles VALUES (?,?)", [(interaction.guild.id, rid) for rid in roles])
+        added = db.total_changes - before
     await interaction.response.send_message(
-        "역할 닉네임 예외 목록을 교체했습니다: " + (", ".join(r.mention for r in roles.values()) or "없음")
+        f"역할 닉네임 예외 {added}개를 추가했습니다. 기존 목록은 유지되며 중복 역할은 제외됩니다."
         + "\n자동 갱신이 켜져 있으면 바로 반영됩니다. 처음에는 /역할닉설정을 실행해 주세요.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    if added:
+        queue_nickname_updates(interaction.guild, interaction.guild.members)
+
+
+@bot.tree.command(name="예외역할목록", description="역할 닉네임 예외 목록을 번호순으로 확인합니다.")
+@app_commands.guild_only()
+async def nickname_exception_list(interaction: discord.Interaction):
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    roles = nickname_exception_ids(interaction.guild.id)
+    if not roles:
+        await interaction.response.send_message("등록된 예외 역할이 없습니다.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    for start in range(0, len(roles), 20):
+        lines = []
+        for number, role_id in enumerate(roles[start:start + 20], start + 1):
+            label = f"<@&{role_id}>" if interaction.guild.get_role(role_id) else f"삭제된 역할 ({role_id})"
+            lines.append(f"{number}. {label}")
+        await interaction.followup.send(
+            "역할 닉네임 예외 목록\n" + "\n".join(lines)
+            + "\n제거: /역할예외제거 번호 · 제거 후 번호는 다시 매겨집니다.",
+            ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
+@bot.tree.command(name="역할예외제거", description="번호에 해당하는 역할 닉네임 예외를 제거합니다.")
+@app_commands.guild_only()
+async def nickname_exception_remove(interaction: discord.Interaction, 번호: app_commands.Range[int, 1]):
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    lock = nickname_locks.setdefault(interaction.guild.id, asyncio.Lock())
+    if lock.locked():
+        await interaction.response.send_message("닉네임 변경 중입니다. 완료 후 설정해 주세요.", ephemeral=True)
+        return
+    async with lock:
+        roles = nickname_exception_ids(interaction.guild.id)
+        if 번호 < 1 or 번호 > len(roles):
+            await interaction.response.send_message("해당 번호가 없습니다. /예외역할목록에서 현재 번호를 확인해 주세요.", ephemeral=True)
+            return
+        role_id = roles[번호 - 1]
+        with closing(nickname_database()) as db, db:
+            db.execute("DELETE FROM nickname_excluded_roles WHERE guild_id=? AND role_id=?", (interaction.guild.id, role_id))
+    await interaction.response.send_message(
+        f"{번호}번 <@&{role_id}> 역할을 예외에서 제거했습니다. 남은 번호는 /예외역할목록에서 확인해 주세요.",
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     queue_nickname_updates(interaction.guild, interaction.guild.members)
 
