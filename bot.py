@@ -1867,11 +1867,13 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     # Nickname-only updates include this bot's own edits: never loop on those.
     if {r.id for r in before.roles} != {r.id for r in after.roles}:
         queue_nickname_updates(after.guild, [after])
+        category_feature.queue(after.guild, after)
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
     queue_nickname_updates(member.guild, [member])
+    category_feature.queue(member.guild, member)
     if member.guild.id in donation_feature.role_guilds():
         async with donation_feature.lock:
             try:
@@ -1883,13 +1885,21 @@ async def on_member_join(member: discord.Member):
 
 @bot.event
 async def on_guild_role_update(before: discord.Role, after: discord.Role):
+    category_feature.queue(after.guild)
     if before.name != after.name or before.position != after.position:
         queue_nickname_updates(after.guild, after.guild.members)
 
 
 @bot.event
 async def on_guild_role_delete(role: discord.Role):
+    category_feature.configure(role.guild.id, [role.id], False)
+    category_feature.queue(role.guild)
     queue_nickname_updates(role.guild, role.guild.members)
+
+
+@bot.event
+async def on_guild_role_create(role: discord.Role):
+    category_feature.queue(role.guild)
 
 
 @bot.event
@@ -1897,6 +1907,7 @@ async def on_ready():
     # Reconcile changes that happened while offline; no repeated API calls for matching nicknames.
     for guild in bot.guilds:
         queue_nickname_updates(guild, guild.members)
+        category_feature.queue(guild)
     async with donation_feature.lock:
         problems = await donation_feature.sync_all_rank_roles()
         if problems:
@@ -2058,6 +2069,9 @@ bot.tree.add_command(admin_group)
 
 import donations
 donation_feature = donations.install(bot, database)
+
+import role_categories
+category_feature = role_categories.install(bot, database, is_owner)
 
 # Discord requires a non-empty description for slash commands and their options.
 for command in bot.tree.walk_commands():
