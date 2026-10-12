@@ -516,33 +516,38 @@ def install(bot, database):
         await interaction.response.defer(ephemeral=True)
         async with feature.lock:
             config = feature.store.settings(interaction.guild.id)
-            if not config['notice_template']:
+            send_notice = 금액 > 10_000
+            if send_notice and not config['notice_template']:
                 await interaction.followup.send('먼저 `/후원기록공지등록`으로 공지 양식을 등록해 주세요.', ephemeral=True)
                 return
-            try:
-                channel = await feature.channel(config['notice_channel'])
-                perms = channel.permissions_for(interaction.guild.me)
-                if not perms.view_channel or not perms.send_messages:
-                    raise ValueError('후원 공지방 권한이 없습니다.')
-            except (ValueError, discord.HTTPException):
-                await interaction.followup.send('후원 공지방 등록과 봇 권한을 확인해 주세요. 기록은 저장되지 않았습니다.', ephemeral=True)
-                return
+            if send_notice:
+                try:
+                    channel = await feature.channel(config['notice_channel'])
+                    perms = channel.permissions_for(interaction.guild.me)
+                    if not perms.view_channel or not perms.send_messages:
+                        raise ValueError('후원 공지방 권한이 없습니다.')
+                except (ValueError, discord.HTTPException):
+                    await interaction.followup.send('후원 공지방 등록과 봇 권한을 확인해 주세요. 기록은 저장되지 않았습니다.', ephemeral=True)
+                    return
             if not feature.store.record(interaction.id, 유저.id, 금액, interaction.guild.id, interaction.user.id):
                 await interaction.followup.send('이미 처리한 후원 요청입니다. 중복 합산하지 않았습니다.', ephemeral=True)
                 return
             problems = await feature.sync_all_rank_roles()
-            try:
-                total = dict(feature.store.totals()).get(유저.id, 0)
-                await channel.send(render(config['notice_template'], 유저.id, 금액, usermoney=total),
-                    allowed_mentions=discord.AllowedMentions(users=[유저], roles=False, everyone=False))
-            except discord.HTTPException:
-                problems.append('후원 공지 전송 실패')
+            if send_notice:
+                try:
+                    total = dict(feature.store.totals()).get(유저.id, 0)
+                    await channel.send(render(config['notice_template'], 유저.id, 금액, usermoney=total),
+                        allowed_mentions=discord.AllowedMentions(users=[유저], roles=False, everyone=False))
+                except discord.HTTPException:
+                    problems.append('후원 공지 전송 실패')
             for guild_id in feature.store.ranking_guilds():
                 try:
                     await feature.update_ranking(guild_id)
                 except (ValueError, discord.HTTPException):
                     problems.append(f'랭킹 갱신 실패 (서버 {guild_id})')
             result = f'{유저.mention}님의 {금액}원 후원을 저장했습니다.'
+            if not send_notice:
+                result += '\n이번 후원은 1만 원 이하이므로 기록방 공지는 생략했습니다.'
             if problems:
                 result += '\n' + '\n'.join(problems[:10]) + '\n기록은 이미 반영되었습니다. 같은 후원을 다시 기록하면 중복 합산됩니다. 랭킹은 `/후원랭킹메시지`로 다시 갱신할 수 있습니다.'
             await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
