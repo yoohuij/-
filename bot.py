@@ -340,7 +340,7 @@ def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool)
 
 def is_bot_administrator(guild_id: int, user_id: int) -> bool:
     """서버 ID는 기존 호출 호환용이며, 권한은 봇 전체 명단에서 조회합니다."""
-    with database() as connection:
+    with closing(database()) as connection:
         row = connection.execute(
             "SELECT 1 FROM global_administrators WHERE user_id = ?",
             (user_id,),
@@ -349,7 +349,7 @@ def is_bot_administrator(guild_id: int, user_id: int) -> bool:
 
 
 def set_bot_administrator(guild_id: int, user_id: int, is_administrator: bool) -> None:
-    with database() as connection:
+    with closing(database()) as connection, connection:
         if is_administrator:
             connection.execute(
                 "INSERT OR IGNORE INTO global_administrators (user_id) VALUES (?)",
@@ -363,7 +363,7 @@ def set_bot_administrator(guild_id: int, user_id: int, is_administrator: bool) -
 
 
 def get_bot_administrator_ids(guild_id: int) -> list[int]:
-    with database() as connection:
+    with closing(database()) as connection:
         rows = connection.execute(
             "SELECT user_id FROM global_administrators ORDER BY user_id",
         ).fetchall()
@@ -2068,7 +2068,7 @@ bot.tree.add_command(meeting_group)
 bot.tree.add_command(admin_group)
 
 import donations
-donation_feature = donations.install(bot, database)
+donation_feature = donations.install(bot, database, is_bot_administrator)
 
 import role_categories
 category_feature = role_categories.install(bot, database, is_owner)
