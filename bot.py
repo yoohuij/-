@@ -794,6 +794,9 @@ class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
     content = discord.ui.TextInput(label="공지 내용", style=discord.TextStyle.paragraph, max_length=1500)
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if not can_use_notice_admin(interaction):
+            await interaction.response.send_message("소유자 또는 등록된 관리자만 회의 공지를 보낼 수 있습니다.", ephemeral=True)
+            return
         if interaction.guild is None:
             await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
             return
@@ -1073,8 +1076,8 @@ async def meeting_notice(interaction: discord.Interaction) -> None:
     if interaction.guild is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 회의 공지를 보낼 수 있습니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 회의 공지를 보낼 수 있습니다.", ephemeral=True)
         return
     if get_meeting_settings(interaction.guild.id).notice_channel_id is None:
         await interaction.response.send_message("먼저 `/공지방등록`으로 공지방을 지정해 주세요.", ephemeral=True)
@@ -1635,9 +1638,22 @@ class MeetingEndView(discord.ui.View):
 meeting_group = app_commands.Group(name="회의", description="회의 시작과 종료를 관리합니다.")
 
 
-async def change_meeting_state(interaction: discord.Interaction, starting: bool) -> None:
+@bot.tree.command(name="사유초기화", description="소유자 전용: 이 서버의 불참자 명단과 사유를 초기화합니다.")
+@app_commands.guild_only()
+async def reset_meeting_reasons(interaction: discord.Interaction) -> None:
     if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 초기화할 수 있습니다.", ephemeral=True)
+        return
+    counts = reset_absence_data(interaction.guild.id)
+    await interaction.response.send_message(
+        f"불참자 {counts[0]}명과 사유 신청 {counts[1]}건을 초기화했습니다. 사유방의 기존 메시지는 남습니다. 회의 진행 상태는 유지됩니다.",
+        ephemeral=True,
+    )
+
+
+async def change_meeting_state(interaction: discord.Interaction, starting: bool) -> None:
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
     guild_id = interaction.guild.id
     phase = meeting_phase(guild_id)
