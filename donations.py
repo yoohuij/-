@@ -148,6 +148,7 @@ class DonationFeature:
         self.bot = bot
         self.store = DonationStore(database)
         self.lock = asyncio.Lock()
+        self.administrator_check = None
 
     def role_guilds(self):
         with self.store.connection() as db:
@@ -272,6 +273,16 @@ class DonationFeature:
                 problems.append(f'후원 역할 갱신 실패 (서버 {guild_id}): 해당 /랭크역할·/후원역할·/후원자역할 설정으로 재시도해 주세요.')
         return problems
 
+    async def manager_check(self, interaction):
+        if interaction.guild and (
+            interaction.user.id == self.bot.application_owner_id
+            or (self.administrator_check is not None
+                and self.administrator_check(interaction.guild.id, interaction.user.id))
+        ):
+            return True
+        await interaction.response.send_message('봇 소유자 또는 /관리자 부여로 등록된 관리자만 사용할 수 있습니다.', ephemeral=True)
+        return False
+
     async def owner_check(self, interaction):
         if interaction.guild and interaction.user.id == self.bot.application_owner_id:
             return True
@@ -344,7 +355,7 @@ class DonationTemplateModal(discord.ui.Modal):
         self.add_item(self.body)
 
     async def on_submit(self, interaction):
-        if not await self.feature.owner_check(interaction):
+        if not await self.feature.manager_check(interaction):
             return
         template = self.body.value.strip()
         if self.ranking:
@@ -370,13 +381,14 @@ class DonationTemplateModal(discord.ui.Modal):
         await interaction.followup.send('랭킹 양식을 저장하고 상위 3명 메시지를 갱신했습니다.' if self.ranking else '후원 공지 양식을 저장했습니다.', ephemeral=True)
 
 
-def install(bot, database):
+def install(bot, database, administrator_check=None):
     feature = DonationFeature(bot, database)
+    feature.administrator_check = administrator_check
 
     @bot.tree.command(name='후원자역할', description='·')
     @app_commands.guild_only()
     async def supporter_role(interaction: discord.Interaction, 역할: discord.Role):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         me = interaction.guild.me
         if (me is None or not me.guild_permissions.manage_roles or 역할.guild.id != interaction.guild.id
@@ -407,7 +419,7 @@ def install(bot, database):
         세번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 세번째역할: discord.Role | None = None,
         네번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 네번째역할: discord.Role | None = None,
         다섯번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 다섯번째역할: discord.Role | None = None):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         pairs = [(첫번째역할금액,첫번째역할),(두번째역할금액,두번째역할),(세번째역할금액,세번째역할),(네번째역할금액,네번째역할),(다섯번째역할금액,다섯번째역할)]
         if any((amount is None) != (role is None) for amount,role in pairs):
@@ -443,7 +455,7 @@ def install(bot, database):
     @app_commands.guild_only()
     @app_commands.rename(first='1위역할', second='2위역할', third='3위역할')
     async def rank_roles(interaction: discord.Interaction, first: discord.Role, second: discord.Role, third: discord.Role):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         roles = (first,second,third)
         me = interaction.guild.me
@@ -467,7 +479,7 @@ def install(bot, database):
         await interaction.followup.send('후원 1·2·3위 전용 역할을 저장하고 적용했습니다. 후원 기록·차감·삭제 시 자동 갱신됩니다.', ephemeral=True)
 
     async def register_channel(interaction, channel, ranking):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         perms = channel.permissions_for(interaction.guild.me)
         if not perms.view_channel or not perms.send_messages or (ranking and not perms.read_message_history):
@@ -496,19 +508,19 @@ def install(bot, database):
     @bot.tree.command(name='후원기록공지등록', description='후원 공지 양식: {user} 유저, {money} 이번 금액, {usermoney} 누적 금액')
     @app_commands.guild_only()
     async def notice_template(interaction: discord.Interaction):
-        if await feature.owner_check(interaction):
+        if await feature.manager_check(interaction):
             await interaction.response.send_modal(DonationTemplateModal(feature, False))
 
     @bot.tree.command(name='후원랭킹메시지', description='1·2·3위 태그를 사용한 랭킹 전체 양식을 등록하고 게시합니다.')
     @app_commands.guild_only()
     async def ranking_template(interaction: discord.Interaction):
-        if await feature.owner_check(interaction):
+        if await feature.manager_check(interaction):
             await interaction.response.send_modal(DonationTemplateModal(feature, True))
 
     @bot.tree.command(name='후원기록', description='후원 금액을 누적 저장하고 후원 공지와 랭킹을 갱신합니다.')
     @app_commands.guild_only()
     async def record(interaction: discord.Interaction, 유저: discord.User, 금액: app_commands.Range[int, 1, 10**12]):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         if 유저.bot:
             await interaction.response.send_message('봇 계정에는 후원을 기록할 수 없습니다.', ephemeral=True)
