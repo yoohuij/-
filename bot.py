@@ -632,6 +632,7 @@ class MemberResultView(discord.ui.View):
         empty_message: str,
         mention_message: str,
         refresh_members=None,
+        excluded_count: int | None = None,
     ) -> None:
         super().__init__(timeout=900)
         self.owner_id = owner_id
@@ -641,6 +642,7 @@ class MemberResultView(discord.ui.View):
         self.count_label = count_label
         self.mention_message = mention_message
         self.refresh_members = refresh_members
+        self.excluded_count = excluded_count
         self.empty_message = empty_message
         self.refresh_lock = asyncio.Lock()
         self.pages = make_member_pages(members, empty_message)
@@ -663,10 +665,15 @@ class MemberResultView(discord.ui.View):
 
     def embed(self) -> discord.Embed:
         embed = discord.Embed(title=self.title, colour=discord.Colour.orange())
-        embed.add_field(name="대상 인원", value=f"{self.total_members}명", inline=True)
+        embed.add_field(name="전체 인원" if self.excluded_count is not None else "대상 인원", value=f"{self.total_members}명", inline=True)
+        if self.excluded_count is not None:
+            embed.add_field(name="예외 인원", value=f"{self.excluded_count}명", inline=True)
         embed.add_field(name=self.count_label, value=f"{len(self.members)}명", inline=True)
         embed.description = self.pages[self.page]
         embed.set_footer(text=f"페이지 {self.page + 1}/{len(self.pages)} · 목록에서는 멘션되지 않습니다.")
+        if self.excluded_count is not None:
+            reacted = self.total_members - self.excluded_count - len(self.members)
+            embed.set_footer(text=f"페이지 {self.page + 1}/{len(self.pages)} · 반응자 {reacted}명 · 예외 인원은 예외자·불참자 중복 제외 합계 · 목록에서는 멘션되지 않습니다.")
         return embed
 
     @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary)
@@ -696,11 +703,12 @@ class MemberResultView(discord.ui.View):
         if self.refresh_members is None:
             return True
         try:
-            members, total = await asyncio.wait_for(self.refresh_members(), timeout=90)
+            members, total, excluded = await asyncio.wait_for(self.refresh_members(), timeout=90)
         except (discord.HTTPException, ValueError, asyncio.TimeoutError):
             await interaction.followup.send("최신 반응을 확인하지 못했습니다. 잘못된 멘션을 막기 위해 전송하지 않습니다. 메시지와 봇 권한을 확인해 주세요.", ephemeral=True)
             return False
         self.members, self.total_members = members, total
+        self.excluded_count = excluded
         self.pages = make_member_pages(members, self.empty_message)
         self.page = 0
         self.update_buttons()
@@ -971,8 +979,8 @@ async def on_voice_state_update(
     )
 
 
-async def get_meeting_members(guild: discord.Guild, meeting_channel_id: int) -> list[discord.Member]:
-    exempt_ids = get_notice_exemptions(guild.id)
+async def get_meeting_members(guild: discord.Guild, meeting_channel_id: int, *, include_excluded=False) -> list[discord.Member]:
+    exempt_ids = set() if include_excluded else get_notice_exemptions(guild.id)
     return [
         member
         async for member in guild.fetch_members(limit=None)
@@ -1187,8 +1195,10 @@ async def get_idle_members(guild, channel, message_id):
     # Always fetch again: an earlier result must not be reused for a mention.
     message = await channel.fetch_message(message_id)
     reacted_ids = await collect_reacted_ids(message)
-    members = await get_meeting_members(guild, meeting_channel_id)
-    return [m for m in members if m.id not in reacted_ids], len(members)
+    members = await get_meeting_members(guild, meeting_channel_id, include_excluded=True)
+    excluded_ids = get_notice_exemptions(guild.id) | {uid for uid, _ in get_approved_absences(guild.id)}
+    eligible = [m for m in members if m.id not in excluded_ids]
+    return [m for m in eligible if m.id not in reacted_ids], len(members), len(members) - len(eligible)
 
 
 @bot.tree.command(name="잠수확인", description="회의방 참여자 중 메시지에 일반·슈퍼 반응을 달지 않은 사람을 확인합니다.")
@@ -1217,7 +1227,7 @@ async def check_idle_members(interaction: discord.Interaction, 메시지_id: str
         return await get_idle_members(interaction.guild, interaction.channel, message_id)
 
     try:
-        idle_members, total = await asyncio.wait_for(refresh_members(), timeout=90)
+        idle_members, total, excluded = await asyncio.wait_for(refresh_members(), timeout=90)
     except discord.NotFound:
         await interaction.followup.send("현재 채널에서 해당 메시지나 반응을 찾지 못했습니다. 메시지가 있는 채널에서 다시 실행해 주세요.", ephemeral=True)
         return
@@ -1230,9 +1240,10 @@ async def check_idle_members(interaction: discord.Interaction, 메시지_id: str
         total,
         "회의방 잠수 확인",
         "미반응자",
-        "현재 회의방에 참여한 모든 사람이 메시지에 반응했습니다.",
+        "예외자·불참자를 제외한 회의방 인원 중 미반응자가 없습니다.",
         "반응 확인 부탁드립니다.",
         refresh_members=refresh_members,
+        excluded_count=excluded,
     )
     await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
