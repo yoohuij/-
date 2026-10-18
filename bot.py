@@ -2201,7 +2201,7 @@ import lawless
 lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
 
 import deputies
-deputy_feature = deputies.install(bot, database)
+deputy_feature = deputies.install(bot, database, is_bot_administrator)
 
 # Discord requires a non-empty description for slash commands and their options.
 for command in bot.tree.walk_commands():
