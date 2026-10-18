@@ -2189,6 +2189,9 @@ donation_feature = donations.install(bot, database, is_bot_administrator)
 import role_categories
 category_feature = role_categories.install(bot, database, is_owner)
 
+import lawless
+lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
+
 # Discord requires a non-empty description for slash commands and their options.
 for command in bot.tree.walk_commands():
     command.description = '·'
