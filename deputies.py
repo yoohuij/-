@@ -34,7 +34,7 @@ class Deputies:
                    for kind, target_id in self.entries(interaction.guild.id))
 
 
-def install(bot, database):
+def install(bot, database, administrator_check=None):
     feature = Deputies(database)
     group = app_commands.Group(name='업자', description='회의 조회 전용 업자 권한을 관리합니다.')
 
@@ -45,7 +45,14 @@ def install(bot, database):
         return False
 
     async def change(interaction, role, user, adding):
-        if not await owner_only(interaction):
+        if adding:
+            allowed = interaction.guild is not None and (
+                interaction.user.id == bot.application_owner_id or
+                (administrator_check is not None and administrator_check(interaction.guild.id, interaction.user.id)))
+            if not allowed:
+                await interaction.response.send_message('봇 소유자 또는 봇에 등록된 관리자만 업자 권한을 부여할 수 있습니다.', ephemeral=True)
+                return
+        elif not await owner_only(interaction):
             return
         if (role is None) == (user is None):
             await interaction.response.send_message('역할 또는 유저 중 하나만 지정해 주세요.', ephemeral=True)
