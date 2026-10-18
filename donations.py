@@ -528,7 +528,7 @@ def install(bot, database, administrator_check=None):
         await interaction.response.defer(ephemeral=True)
         async with feature.lock:
             config = feature.store.settings(interaction.guild.id)
-            send_notice = 금액 > 10_000
+            send_notice = 금액 >= 10_000
             if send_notice and not config['notice_template']:
                 await interaction.followup.send('먼저 `/후원기록공지등록`으로 공지 양식을 등록해 주세요.', ephemeral=True)
                 return
