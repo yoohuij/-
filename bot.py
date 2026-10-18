@@ -1187,12 +1187,55 @@ async def collect_reacted_ids(message):
     return reacted_ids
 
 
+async def find_guild_message(guild, preferred_channel, message_id):
+    """Message IDs do not contain a channel ID; search readable server channels."""
+    seen = set()
+
+    async def lookup(channel):
+        if channel is None or channel.id in seen or not hasattr(channel, "fetch_message"):
+            return None
+        if getattr(channel, "guild", None) != guild:
+            return None
+        seen.add(channel.id)
+        permissions = channel.permissions_for(guild.me)
+        if not permissions.view_channel or not permissions.read_message_history:
+            return None
+        try:
+            return await channel.fetch_message(message_id)
+        except (discord.NotFound, discord.Forbidden):
+            return None
+
+    for candidate in [preferred_channel, *guild.channels, *guild.threads]:
+        message = await lookup(candidate)
+        if message is not None:
+            return message
+    # Archived threads are not included in the guild's active thread cache.
+    for parent in guild.channels:
+        if not hasattr(parent, "archived_threads"):
+            continue
+        permissions = parent.permissions_for(guild.me)
+        if not permissions.view_channel or not permissions.read_message_history:
+            continue
+        modes = [{}]
+        if isinstance(parent, discord.TextChannel):
+            modes.append({"private": True, "joined": not permissions.manage_threads})
+        for mode in modes:
+            try:
+                async for thread in parent.archived_threads(limit=None, **mode):
+                    message = await lookup(thread)
+                    if message is not None:
+                        return message
+            except discord.Forbidden:
+                continue
+    raise ValueError("같은 서버에서 봇이 읽을 수 있는 메시지를 찾지 못했습니다.")
+
+
 async def get_idle_members(guild, channel, message_id):
     meeting_channel_id = get_meeting_settings(guild.id).meeting_channel_id
     if meeting_channel_id is None:
         raise ValueError("회의방이 등록되지 않았습니다.")
     # Always fetch again: an earlier result must not be reused for a mention.
-    message = await channel.fetch_message(message_id)
+    message = await find_guild_message(guild, channel, message_id)
     reacted_ids = await collect_reacted_ids(message)
     members = await get_meeting_members(guild, meeting_channel_id, include_excluded=True)
     excluded_ids = get_notice_exemptions(guild.id) | {uid for uid, _ in get_approved_absences(guild.id)}
@@ -1228,7 +1271,7 @@ async def check_idle_members(interaction: discord.Interaction, 메시지_id: str
     try:
         idle_members, total, excluded = await asyncio.wait_for(refresh_members(), timeout=90)
     except discord.NotFound:
-        await interaction.followup.send("현재 채널에서 해당 메시지나 반응을 찾지 못했습니다. 메시지가 있는 채널에서 다시 실행해 주세요.", ephemeral=True)
+        await interaction.followup.send("해당 메시지나 반응을 찾지 못했습니다. 메시지 ID와 봇의 채널 읽기 권한을 확인해 주세요.", ephemeral=True)
         return
     except (discord.HTTPException, ValueError, asyncio.TimeoutError):
         await interaction.followup.send("메시지·반응·인원 조회를 완료하지 못했습니다. 일부 결과로 잠수자를 판정하지 않습니다. 권한 확인 후 다시 시도해 주세요.", ephemeral=True)
@@ -1247,6 +1290,53 @@ async def check_idle_members(interaction: discord.Interaction, 메시지_id: str
     await interaction.followup.send(embed=view.embed(), view=view, allowed_mentions=discord.AllowedMentions.none())
 
 
+
+
+async def get_outside_reactors(guild, channel, message_id):
+    meeting_id = get_meeting_settings(guild.id).meeting_channel_id
+    if meeting_id is None:
+        raise ValueError("먼저 `/회의방등록`으로 회의방을 지정해 주세요.")
+    message = await find_guild_message(guild, channel, message_id)
+    reacted_ids = await collect_reacted_ids(message)
+    exempt_ids = get_notice_exemptions(guild.id)
+    members = [m async for m in guild.fetch_members(limit=None)
+               if not m.bot and m.id in reacted_ids and m.id not in exempt_ids]
+    outside = [m for m in members if m.voice is None or m.voice.channel is None
+               or m.voice.channel.id != meeting_id]
+    return outside, len(members)
+
+
+@bot.tree.command(name="미참여반응자", description="회의방 밖에서 반응한 사람을 비공개로 확인합니다.")
+async def check_outside_reactors(interaction: discord.Interaction, 메시지id: str):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+    if not is_owner(interaction):
+        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+        return
+    try:
+        message_id = int(메시지id)
+        if message_id <= 0:
+            raise ValueError
+    except ValueError:
+        await interaction.response.send_message("올바른 메시지 ID를 입력해 주세요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        members, total = await asyncio.wait_for(
+            get_outside_reactors(interaction.guild, interaction.channel, message_id), timeout=90)
+    except ValueError as exc:
+        await interaction.followup.send(str(exc), ephemeral=True)
+        return
+    except (discord.HTTPException, asyncio.TimeoutError):
+        await interaction.followup.send("조회를 완료하지 못했습니다. 메시지 ID와 채널 권한을 확인한 뒤 다시 시도해 주세요.", ephemeral=True)
+        return
+    view = MemberResultView(interaction.user.id, members, total,
+                            "회의 미참여 반응자", "미참여 반응자",
+                            "회의방 밖에서 반응한 사람이 없습니다.", "")
+    view.remove_item(view.mention)
+    await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True,
+                                   allowed_mentions=discord.AllowedMentions.none())
 
 
 class NoticeModal(discord.ui.Modal, title="공지 작성"):
