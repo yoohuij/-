@@ -38,21 +38,17 @@ def install(bot, database, administrator_check=None):
     feature = Deputies(database)
     group = app_commands.Group(name='업자', description='회의 조회 전용 업자 권한을 관리합니다.')
 
-    async def owner_only(interaction):
-        if interaction.guild is not None and interaction.user.id == bot.application_owner_id:
+    async def manager_only(interaction):
+        if interaction.guild is not None and (
+            interaction.user.id == bot.application_owner_id or
+            (administrator_check is not None and administrator_check(interaction.guild.id, interaction.user.id))
+        ):
             return True
-        await interaction.response.send_message('서버에서 봇 소유자만 업자 권한을 관리할 수 있습니다.', ephemeral=True)
+        await interaction.response.send_message('봇 소유자 또는 봇에 등록된 관리자만 업자 권한을 관리할 수 있습니다.', ephemeral=True)
         return False
 
     async def change(interaction, role, user, adding):
-        if adding:
-            allowed = interaction.guild is not None and (
-                interaction.user.id == bot.application_owner_id or
-                (administrator_check is not None and administrator_check(interaction.guild.id, interaction.user.id)))
-            if not allowed:
-                await interaction.response.send_message('봇 소유자 또는 봇에 등록된 관리자만 업자 권한을 부여할 수 있습니다.', ephemeral=True)
-                return
-        elif not await owner_only(interaction):
+        if not await manager_only(interaction):
             return
         if (role is None) == (user is None):
             await interaction.response.send_message('역할 또는 유저 중 하나만 지정해 주세요.', ephemeral=True)
@@ -82,7 +78,7 @@ def install(bot, database, administrator_check=None):
     @group.command(name='목록', description='현재 서버의 업자 등록 목록을 확인합니다.')
     @app_commands.guild_only()
     async def listing(interaction: discord.Interaction):
-        if not await owner_only(interaction):
+        if not await manager_only(interaction):
             return
         await interaction.response.defer(ephemeral=True)
         rows = feature.entries(interaction.guild.id)
