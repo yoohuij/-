@@ -897,19 +897,18 @@ class AbsenceDecisionView(discord.ui.View):
         if not is_owner(interaction):
             await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사유를 처리할 수 있습니다.", ephemeral=True)
             return
+        if interaction.message is None or not interaction.message.embeds:
+            await interaction.response.send_message("원본 신청 임베드를 찾을 수 없어 처리하지 않았습니다.", ephemeral=True)
+            return
+        embeds = [embed.copy() for embed in interaction.message.embeds]
+        embeds[0].colour = discord.Colour.green() if approved else discord.Colour.red()
         result = approve_absence_request(self.request_id, interaction.user.id) if approved else reject_absence_request(self.request_id)
         if result is None:
             await interaction.response.send_message("이미 처리되었거나 존재하지 않는 신청입니다.", ephemeral=True)
             return
         for item in self.children:
             item.disabled = True
-        if approved:
-            embed = discord.Embed(title="불참 사유 승인됨", colour=discord.Colour.green())
-            embed.description = "승인된 신청자는 불참자 명단에 추가되었습니다."
-        else:
-            embed = discord.Embed(title="불참 사유 거절됨", colour=discord.Colour.red())
-            embed.description = "신청 자료는 폐기되었으며 불참자 명단에 추가되지 않았습니다."
-        await interaction.response.edit_message(embed=embed, view=self, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.response.edit_message(embeds=embeds, view=self, allowed_mentions=discord.AllowedMentions.none())
 
 
 class AttendanceBot(discord.Client):
