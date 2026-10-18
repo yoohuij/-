@@ -548,8 +548,12 @@ def install(bot, database, administrator_check=None):
             if send_notice:
                 try:
                     total = dict(feature.store.totals()).get(유저.id, 0)
-                    await channel.send(render(config['notice_template'], 유저.id, 금액, usermoney=total),
-                        allowed_mentions=discord.AllowedMentions(users=[유저], roles=False, everyone=False))
+                    content = render(config['notice_template'], 유저.id, 금액, usermoney=total)
+                    ping_everyone = 금액 >= 30_000
+                    if ping_everyone:
+                        content = '|| @everyone ||\n' + content
+                    await channel.send(content,
+                        allowed_mentions=discord.AllowedMentions(users=[유저], roles=False, everyone=ping_everyone))
                 except discord.HTTPException:
                     problems.append('후원 공지 전송 실패')
             for guild_id in feature.store.ranking_guilds():
@@ -559,7 +563,7 @@ def install(bot, database, administrator_check=None):
                     problems.append(f'랭킹 갱신 실패 (서버 {guild_id})')
             result = f'{유저.mention}님의 {금액}원 후원을 저장했습니다.'
             if not send_notice:
-                result += '\n이번 후원은 1만 원 이하이므로 기록방 공지는 생략했습니다.'
+                result += '\n이번 후원은 1만 원 미만이므로 기록방 공지는 생략했습니다.'
             if problems:
                 result += '\n' + '\n'.join(problems[:10]) + '\n기록은 이미 반영되었습니다. 같은 후원을 다시 기록하면 중복 합산됩니다. 랭킹은 `/후원랭킹메시지`로 다시 갱신할 수 있습니다.'
             await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
