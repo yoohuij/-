@@ -1779,6 +1779,12 @@ async def process_meeting_state(interaction: discord.Interaction, starting: bool
     if (starting and phase == "active") or (not starting and phase != "active"):
         await interaction.followup.send("이미 회의 중입니다." if starting else "진행 중인 회의가 없습니다.", ephemeral=True)
         return
+    if starting:
+        try:
+            meeting_chat_feature.begin(guild_id)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return
     settings = get_meeting_settings(guild_id)
     if starting and (settings.meeting_channel_id is None or settings.log_channel_id is None):
         await interaction.followup.send("먼저 회의방과 로그방을 등록해 주세요.", ephemeral=True)
