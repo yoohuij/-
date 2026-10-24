@@ -1,4 +1,4 @@
-"""Server-wide human voice count, with a persistent display channel."""
+"""Server-wide voice count including bots, with a persistent display channel."""
 import asyncio
 import logging
 from contextlib import closing
@@ -7,20 +7,10 @@ from discord import app_commands
 from discord.ext import tasks
 
 
-async def human_voice_count(guild):
+async def voice_count(guild):
     ids = {uid for channel in [*guild.voice_channels, *guild.stage_channels]
            for uid in channel.voice_states}
-    count = 0
-    for uid in ids:
-        member = guild.get_member(uid)
-        if member is None:
-            try:
-                member = await guild.fetch_member(uid)
-            except discord.NotFound:
-                continue
-        if not member.bot:
-            count += 1
-    return count
+    return len(ids)
 
 
 class VoiceActivity:
@@ -65,7 +55,7 @@ class VoiceActivity:
             channel = await self.get_channel(guild)
             if channel is None:
                 return
-            name = f'통방 활동률 : {await human_voice_count(guild)}명'
+            name = f'통방 활동률 : {await voice_count(guild)}명'
             if channel.name != name:
                 await channel.edit(name=name, reason='서버 전체 통방 접속 인원 갱신')
 
@@ -109,7 +99,7 @@ def install(bot, database, manager_check):
                 async with feature.lock(interaction.guild.id):
                     channel = await feature.get_channel(interaction.guild)
                     if channel is None:
-                        count = await human_voice_count(interaction.guild)
+                        count = await voice_count(interaction.guild)
                         channel = await interaction.guild.create_voice_channel(
                             f'통방 활동률 : {count}명', category=카테고리,
                             overwrites={interaction.guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
@@ -120,7 +110,7 @@ def install(bot, database, manager_check):
                     await channel.move(beginning=True, category=카테고리, sync_permissions=False,
                                        reason='카테고리 음성 채널 목록 맨 위로 이동')
             await interaction.followup.send(
-                f'{channel.mention} 설정 완료. 서버 전체 음성방·스테이지의 인원을 봇 제외로 집계하며 약 5분마다 자동 갱신합니다. 다시 지정하면 기존 표시 채널을 이동합니다.',
+                f'{channel.mention} 설정 완료. 서버 전체 음성방·스테이지의 접속 계정(봇 포함)을 집계하며 약 5분마다 자동 갱신합니다. 다시 지정하면 기존 표시 채널을 이동합니다.',
                 ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
         except (discord.HTTPException, ValueError, asyncio.TimeoutError):
             await interaction.followup.send('설정을 완료하지 못했습니다. 채널 관리 권한 확인 후 다시 실행해 주세요. 생성된 표시 채널은 재사용합니다.', ephemeral=True)
