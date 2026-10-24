@@ -798,7 +798,7 @@ class AbsenceReasonModal(discord.ui.Modal, title="불참 사유 신청"):
             await interaction.response.send_message("사유방에 신청을 보낼 수 없습니다. 봇 권한을 확인해 주세요.", ephemeral=True)
             return
         set_absence_request_message(request_id, reason_channel.id, request_message.id)
-        await interaction.response.send_message("불참 사유 신청을 보냈습니다. 소유주의 검토를 기다려 주세요.", ephemeral=True)
+        await interaction.response.send_message("불참 사유 신청을 보냈습니다. 관리자의 검토를 기다려 주세요.", ephemeral=True)
 
 
 class MeetingAnnouncementModal(discord.ui.Modal, title="회의 공지 작성"):
@@ -898,8 +898,8 @@ class AbsenceDecisionView(discord.ui.View):
         self.add_item(AbsenceDecisionButton(request_id, approved=False))
 
     async def handle_decision(self, interaction: discord.Interaction, approved: bool) -> None:
-        if not is_owner(interaction):
-            await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사유를 처리할 수 있습니다.", ephemeral=True)
+        if not can_use_notice_admin(interaction):
+            await interaction.response.send_message("소유자 또는 등록된 관리자만 사유를 처리할 수 있습니다.", ephemeral=True)
             return
         if interaction.message is None or not interaction.message.embeds:
             await interaction.response.send_message("원본 신청 임베드를 찾을 수 없어 처리하지 않았습니다.", ephemeral=True)
@@ -1101,8 +1101,8 @@ async def meeting_notice(interaction: discord.Interaction) -> None:
 @app_commands.describe(동작="추가 또는 제거", 유저="불참 명단을 변경할 유저")
 @app_commands.choices(동작=[app_commands.Choice(name="추가", value="add"), app_commands.Choice(name="제거", value="remove")])
 async def manual_absence(interaction: discord.Interaction, 동작: app_commands.Choice[str], 유저: discord.Member) -> None:
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 불참자를 관리할 수 있습니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 불참자를 관리할 수 있습니다.", ephemeral=True)
         return
     if 유저.bot:
         await interaction.response.send_message("봇은 불참자 대상이 아닙니다.", ephemeral=True)
@@ -1319,8 +1319,8 @@ async def check_outside_reactors(interaction: discord.Interaction, 메시지id: 
     if interaction.guild is None or interaction.channel is None:
         await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
         return
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
     try:
         message_id = int(메시지id)
@@ -1551,7 +1551,7 @@ def warning_role(guild: discord.Guild) -> discord.Role:
 
 
 def can_warn(interaction: discord.Interaction) -> bool:
-    return is_owner(interaction) or (
+    return can_use_notice_admin(interaction) or (
         isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_roles
     )
 
@@ -1559,7 +1559,7 @@ def can_warn(interaction: discord.Interaction) -> bool:
 async def change_warning_roles(interaction: discord.Interaction, ids: list[int], adding: bool, message_id: int | None = None) -> str:
     guild = interaction.guild
     role = warning_role(guild)
-    if not is_owner(interaction) and role >= interaction.user.top_role:
+    if not can_use_notice_admin(interaction) and role >= interaction.user.top_role:
         raise ValueError("자신의 최고 역할보다 낮은 경고 역할만 관리할 수 있습니다.")
     success, skipped, failed = 0, 0, []
     for uid in dict.fromkeys(ids):
@@ -1662,7 +1662,7 @@ async def warning_command(interaction: discord.Interaction, 동작: app_commands
     user7: discord.Member | None = None, user8: discord.Member | None = None, user9: discord.Member | None = None,
     user10: discord.Member | None = None):
     if not can_warn(interaction):
-        await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("소유자, 등록 관리자 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     members = [m.id for m in (user1,user2,user3,user4,user5,user6,user7,user8,user9,user10) if m is not None]
@@ -1678,7 +1678,7 @@ async def warning_command(interaction: discord.Interaction, 동작: app_commands
 @app_commands.guild_only()
 async def warning_list(interaction: discord.Interaction):
     if not can_warn(interaction):
-        await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("소유자, 등록 관리자 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
     try:
@@ -1701,7 +1701,7 @@ class MeetingEndView(discord.ui.View):
     @discord.ui.button(label="미참여자 경고 부여", style=discord.ButtonStyle.danger, custom_id="meeting_end_warn")
     async def warn_missing(self, interaction: discord.Interaction, _: discord.ui.Button):
         if not can_warn(interaction):
-            await interaction.response.send_message("소유주 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
+            await interaction.response.send_message("소유자, 등록 관리자 또는 역할 관리 권한자가 사용할 수 있습니다.", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         guild_id, message_id = interaction.guild.id, interaction.message.id
@@ -1722,8 +1722,8 @@ class MeetingEndView(discord.ui.View):
 
     @discord.ui.button(label="사유 초기화", style=discord.ButtonStyle.danger, custom_id="meeting_end_reset")
     async def reset(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        if not is_owner(interaction):
-            await interaction.response.send_message("봇 소유자 또는 서버 소유자만 초기화할 수 있습니다.", ephemeral=True)
+        if not can_use_notice_admin(interaction):
+            await interaction.response.send_message("소유자 또는 등록된 관리자만 초기화할 수 있습니다.", ephemeral=True)
             return
         with database() as connection:
             row = connection.execute(
@@ -1746,11 +1746,11 @@ class MeetingEndView(discord.ui.View):
 meeting_group = app_commands.Group(name="회의", description="회의 시작과 종료를 관리합니다.")
 
 
-@bot.tree.command(name="사유초기화", description="소유자 전용: 이 서버의 불참자 명단과 사유를 초기화합니다.")
+@bot.tree.command(name="사유초기화", description="소유자·등록 관리자: 이 서버의 불참자 명단과 사유를 초기화합니다.")
 @app_commands.guild_only()
 async def reset_meeting_reasons(interaction: discord.Interaction) -> None:
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 초기화할 수 있습니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 초기화할 수 있습니다.", ephemeral=True)
         return
     counts = reset_absence_data(interaction.guild.id)
     await interaction.response.send_message(
@@ -2083,8 +2083,8 @@ async def nickname_exceptions(interaction: discord.Interaction,
 @bot.tree.command(name="예외역할목록", description="역할 닉네임 예외 목록을 번호순으로 확인합니다.")
 @app_commands.guild_only()
 async def nickname_exception_list(interaction: discord.Interaction):
-    if not is_owner(interaction):
-        await interaction.response.send_message("봇 소유자 또는 서버 소유자만 사용할 수 있습니다.", ephemeral=True)
+    if not can_use_notice_admin(interaction):
+        await interaction.response.send_message("소유자 또는 등록된 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
     roles = nickname_exception_ids(interaction.guild.id)
     if not roles:
