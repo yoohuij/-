@@ -388,7 +388,7 @@ def install(bot, database, administrator_check=None):
     @bot.tree.command(name='후원자역할', description='·')
     @app_commands.guild_only()
     async def supporter_role(interaction: discord.Interaction, 역할: discord.Role):
-        if not await feature.manager_check(interaction):
+        if not await feature.owner_check(interaction):
             return
         me = interaction.guild.me
         if (me is None or not me.guild_permissions.manage_roles or 역할.guild.id != interaction.guild.id
@@ -419,7 +419,7 @@ def install(bot, database, administrator_check=None):
         세번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 세번째역할: discord.Role | None = None,
         네번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 네번째역할: discord.Role | None = None,
         다섯번째역할금액: app_commands.Range[int, 1, 100_000_000] | None = None, 다섯번째역할: discord.Role | None = None):
-        if not await feature.manager_check(interaction):
+        if not await feature.owner_check(interaction):
             return
         pairs = [(첫번째역할금액,첫번째역할),(두번째역할금액,두번째역할),(세번째역할금액,세번째역할),(네번째역할금액,네번째역할),(다섯번째역할금액,다섯번째역할)]
         if any((amount is None) != (role is None) for amount,role in pairs):
@@ -455,7 +455,7 @@ def install(bot, database, administrator_check=None):
     @app_commands.guild_only()
     @app_commands.rename(first='1위역할', second='2위역할', third='3위역할')
     async def rank_roles(interaction: discord.Interaction, first: discord.Role, second: discord.Role, third: discord.Role):
-        if not await feature.manager_check(interaction):
+        if not await feature.owner_check(interaction):
             return
         roles = (first,second,third)
         me = interaction.guild.me
@@ -479,7 +479,7 @@ def install(bot, database, administrator_check=None):
         await interaction.followup.send('후원 1·2·3위 전용 역할을 저장하고 적용했습니다. 후원 기록·차감·삭제 시 자동 갱신됩니다.', ephemeral=True)
 
     async def register_channel(interaction, channel, ranking):
-        if not await feature.manager_check(interaction):
+        if not await feature.owner_check(interaction):
             return
         perms = channel.permissions_for(interaction.guild.me)
         if not perms.view_channel or not perms.send_messages or (ranking and not perms.read_message_history):
@@ -575,7 +575,7 @@ def install(bot, database, administrator_check=None):
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     async def correct_record(interaction, user, amount=None):
-        if not await feature.owner_check(interaction):
+        if not await feature.manager_check(interaction):
             return
         await interaction.response.defer(ephemeral=True)
         async with feature.lock:
@@ -602,12 +602,12 @@ def install(bot, database, administrator_check=None):
                 result += '\n' + '\n'.join(role_problems[:10])
             await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
-    @bot.tree.command(name='후원기록차감', description='봇 소유자 전용: 지정한 유저의 전체 누적 후원금액을 차감합니다.')
+    @bot.tree.command(name='후원기록차감', description='봇 소유자·등록 관리자: 지정한 유저의 전체 누적 후원금액을 차감합니다.')
     @app_commands.guild_only()
     async def deduct_record(interaction: discord.Interaction, 유저: discord.User, 금액: app_commands.Range[int, 1, 10**12]):
         await correct_record(interaction, 유저, 금액)
 
-    @bot.tree.command(name='후원기록삭제', description='봇 소유자 전용: 지정한 유저의 봇 전체 후원 기록을 삭제합니다.')
+    @bot.tree.command(name='후원기록삭제', description='봇 소유자·등록 관리자: 지정한 유저의 봇 전체 후원 기록을 삭제합니다.')
     @app_commands.guild_only()
     async def delete_record(interaction: discord.Interaction, 유저: discord.User):
         await correct_record(interaction, 유저)
