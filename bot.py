@@ -2028,6 +2028,7 @@ async def on_guild_role_create(role: discord.Role):
 
 @bot.event
 async def on_ready():
+    voice_activity_feature.start()
     # Reconcile changes that happened while offline; no repeated API calls for matching nicknames.
     for guild in bot.guilds:
         queue_nickname_updates(guild, guild.members)
@@ -2202,6 +2203,9 @@ lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
 
 import deputies
 deputy_feature = deputies.install(bot, database, is_bot_administrator)
+
+import voice_activity
+voice_activity_feature = voice_activity.install(bot, database, can_use_notice_admin)
 
 # Discord requires a non-empty description for slash commands and their options.
 for command in bot.tree.walk_commands():
