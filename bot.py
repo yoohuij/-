@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sqlite3
 import time
@@ -1760,19 +1761,28 @@ async def reset_meeting_reasons(interaction: discord.Interaction) -> None:
 
 
 async def change_meeting_state(interaction: discord.Interaction, starting: bool) -> None:
+    await interaction.response.defer(ephemeral=True)
+    lock = meeting_chat_feature.lock(interaction.guild.id)
+    if lock.locked():
+        await interaction.followup.send("회의 처리 중입니다. 잠시 후 다시 시도해 주세요.", ephemeral=True)
+        return
+    async with lock:
+        await process_meeting_state(interaction, starting)
+
+
+async def process_meeting_state(interaction: discord.Interaction, starting: bool) -> None:
     if not can_use_notice_admin(interaction):
-        await interaction.response.send_message("소유자 또는 등록된 관리자만 사용할 수 있습니다.", ephemeral=True)
+        await interaction.followup.send("소유자 또는 등록된 관리자만 사용할 수 있습니다.", ephemeral=True)
         return
     guild_id = interaction.guild.id
     phase = meeting_phase(guild_id)
     if (starting and phase == "active") or (not starting and phase != "active"):
-        await interaction.response.send_message("이미 회의 중입니다." if starting else "진행 중인 회의가 없습니다.", ephemeral=True)
+        await interaction.followup.send("이미 회의 중입니다." if starting else "진행 중인 회의가 없습니다.", ephemeral=True)
         return
     settings = get_meeting_settings(guild_id)
     if starting and (settings.meeting_channel_id is None or settings.log_channel_id is None):
-        await interaction.response.send_message("먼저 회의방과 로그방을 등록해 주세요.", ephemeral=True)
+        await interaction.followup.send("먼저 회의방과 로그방을 등록해 주세요.", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     channel = bot.get_channel(settings.notice_channel_id) if settings.notice_channel_id else None
     try:
         if channel is None and settings.notice_channel_id:
@@ -1788,6 +1798,14 @@ async def change_meeting_state(interaction: discord.Interaction, starting: bool)
                 return
             missing, _ = await get_meeting_non_participants(interaction.guild, settings.meeting_channel_id)
             missing_ids = [member.id for member in missing]
+            try:
+                meeting_chat_feature.validate_voice(meeting_channel)
+                await meeting_chat_feature.cleanup(interaction.guild, settings)
+                await meeting_chat_feature.close_voice(meeting_channel)
+            except (ValueError, discord.HTTPException, asyncio.TimeoutError) as exc:
+                logging.getLogger(__name__).exception("회의 종료 정리 실패")
+                await interaction.followup.send("회의방 퇴장 또는 채팅 청소·잠금을 완료하지 못해 종료를 중단했습니다. 일부 작업은 이미 반영됐을 수 있습니다. 채널 관리·멤버 이동 등 봇 권한을 확인한 뒤 /회의 종료를 다시 실행해 주세요.", ephemeral=True)
+                return
         # 송신 중에도 시작/종료 상태가 적용되며, 실패하면 이전 상태로 복구합니다.
         set_meeting_phase(guild_id, "active" if starting else "ended")
         message = await channel.send(
@@ -2191,6 +2209,9 @@ async def apply_role_nicknames(interaction: discord.Interaction):
 
 bot.tree.add_command(meeting_group)
 bot.tree.add_command(admin_group)
+
+import meeting_chat
+meeting_chat_feature = meeting_chat.install(bot, database, is_owner, get_meeting_settings)
 
 import donations
 donation_feature = donations.install(bot, database, is_bot_administrator)
