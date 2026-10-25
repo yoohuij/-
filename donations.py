@@ -207,6 +207,9 @@ class DonationFeature:
                     db.execute(f'INSERT OR IGNORE INTO {assignment_table} VALUES (?,?,?)', (guild_id,member.id,rid))
                 try:
                     if rid not in held:
+                        guard = getattr(self.bot, 'antiraid_feature', None)
+                        if guard and not guard.automatic_role_allowed(member.id, roles[rid]):
+                            continue
                         await member.add_roles(roles[rid], reason='누적 후원 기준 달성')
                 except discord.HTTPException:
                     failed = True
@@ -254,6 +257,9 @@ class DonationFeature:
                     db.execute('INSERT OR IGNORE INTO donation_role_assignments VALUES (?,?,?)', (guild_id,member.id,wanted))
                 try:
                     if wanted not in held:
+                        guard = getattr(self.bot, 'antiraid_feature', None)
+                        if guard and not guard.automatic_role_allowed(member.id, guild.get_role(wanted)):
+                            continue
                         await member.add_roles(guild.get_role(wanted), reason='후원 상위 3위 역할 지급')
                 except discord.HTTPException:
                     failed = True
