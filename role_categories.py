@@ -76,6 +76,9 @@ class RoleCategories:
                     continue
                 try:
                     if wanted:
+                        guard = getattr(self.bot, 'antiraid_feature', None)
+                        if guard and not guard.automatic_role_allowed(member.id, role):
+                            continue
                         await member.add_roles(role, reason='역할 카테고리 자동 부여')
                     else:
                         await member.remove_roles(role, reason='하위 역할 없음: 카테고리 자동 회수')
