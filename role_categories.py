@@ -23,8 +23,9 @@ def category_memberships(roles, category_ids):
 
 
 class RoleCategories:
-    def __init__(self, bot, database):
+    def __init__(self, bot, database, get_exemptions=None):
         self.bot, self.database = bot, database
+        self.get_exemptions = get_exemptions or (lambda guild_id: set())
         self.pending = {}
         self.full = set()
         self.workers = {}
@@ -71,7 +72,7 @@ class RoleCategories:
                 role = guild.get_role(rid)
                 if role is None or role.managed or role >= me.top_role:
                     continue
-                wanted = bool(held & children)
+                wanted = member.id not in self.get_exemptions(guild.id) and bool(held & children)
                 if wanted == (rid in held):
                     continue
                 try:
@@ -81,7 +82,7 @@ class RoleCategories:
                             continue
                         await member.add_roles(role, reason='역할 카테고리 자동 부여')
                     else:
-                        await member.remove_roles(role, reason='하위 역할 없음: 카테고리 자동 회수')
+                        await member.remove_roles(role, reason='예외 인원 또는 하위 역할 없음: 카테고리 자동 회수')
                 except discord.HTTPException:
                     logging.getLogger(__name__).exception('카테고리 갱신 실패: guild=%s user=%s role=%s', guild.id, member.id, rid)
 
@@ -105,8 +106,8 @@ class RoleCategories:
             self.workers.pop(guild.id, None)
 
 
-def install(bot, database, is_owner):
-    feature = RoleCategories(bot, database)
+def install(bot, database, is_owner, get_exemptions=None):
+    feature = RoleCategories(bot, database, get_exemptions)
 
     @bot.tree.command(name='역할카테고리설정', description='·')
     @app_commands.guild_only()
