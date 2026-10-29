@@ -1470,6 +1470,12 @@ async def set_global_exception(
         return
     adding = 동작.value == "add"
     set_notice_exemption(0, 유저.id, adding)
+    for guild in bot.guilds:
+        member = guild.get_member(유저.id)
+        if member is not None:
+            category_feature.queue(guild, member)
+        else:
+            category_feature.queue(guild)
     result = "예외에 추가했습니다" if adding else "예외에서 제거했습니다"
     await interaction.response.send_message(
         f"{유저.mention}님을 봇 전체 {result}.",
@@ -2259,7 +2265,7 @@ import donations
 donation_feature = donations.install(bot, database, is_bot_administrator)
 
 import role_categories
-category_feature = role_categories.install(bot, database, is_owner)
+category_feature = role_categories.install(bot, database, is_owner, get_notice_exemptions)
 
 import lawless
 lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
