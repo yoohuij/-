@@ -1,4 +1,4 @@
-"""Global donation ledger with per-server announcement and ranking configuration."""
+pass
 import asyncio
 import re
 from contextlib import contextmanager
@@ -8,7 +8,7 @@ from discord import app_commands
 
 
 def render(template: str, user_id: int, money: int, rank: int | None = None, *, usermoney: int | None = None) -> str:
-    # Only replace supported tokens; arbitrary braces in user text remain intact.
+    
     value = discord.utils.escape_mentions(template)
     if rank is not None and '{rank}' not in value:
         value = re.sub(r'^(\s*#{0,3}\s*)\d+\.', lambda m: m[1] + str(rank) + '.', value, count=1)
@@ -28,7 +28,7 @@ def render_ranking(template: str, totals, extra_text=None) -> str:
             result = result.replace('{' + prefix + 'user}', user).replace('{' + prefix + 'money}', money)
         extras = ', '.join(f'<@{uid}>' for uid, _ in totals[3:])
         return result.replace('{exuser}', extras if extra_text is None else extra_text)
-    # Previously saved per-rank templates continue working until replaced.
+    
     return '\n\n'.join(render(template, uid, amount, rank) for rank, (uid, amount) in enumerate(totals[:3], 1)) or '아직 후원 기록이 없습니다.'
 
 
@@ -81,7 +81,7 @@ class DonationStore:
 
     def correct(self, interaction_id, user_id, actor, amount=None):
         with self.connection() as db:
-            # Acquire the write lock before checking the balance.
+            
             db.execute('BEGIN IMMEDIATE')
             if db.execute('SELECT 1 FROM donation_corrections WHERE interaction_id=?', (interaction_id,)).fetchone():
                 return None
@@ -232,7 +232,7 @@ class DonationFeature:
         roles = [guild.get_role(rid) for rid in config]
         if any(r is None or r.is_default() or r.managed or r >= guild.me.top_role for r in roles):
             raise ValueError('랭킹 역할이 없거나 봇보다 높습니다.')
-        # Use the same global ordering as the ranking message, including its tie-break rule.
+        
         desired = {uid: config[index] for index, (uid, _) in enumerate(self.store.totals()[:3])}
         members = [m async for m in guild.fetch_members(limit=None)]
         present = {m.id for m in members}
@@ -252,7 +252,7 @@ class DonationFeature:
                 except discord.HTTPException:
                     failed = removal_failed = True
             if wanted is not None and not removal_failed:
-                # Persist the intended assignment before HTTP so restart can reconcile a lost reply.
+                
                 with self.store.connection() as db:
                     db.execute('INSERT OR IGNORE INTO donation_role_assignments VALUES (?,?,?)', (guild_id,member.id,wanted))
                 try:
@@ -315,7 +315,7 @@ class DonationFeature:
         while len(content) > 2000:
             boundary = max(content.rfind('\n', 0, 1950), content.rfind(' ', 0, 1950))
             boundary = boundary + 1 if boundary >= 0 else 1950
-            # Never split a Discord mention across messages.
+            
             start = content.rfind('<', 0, boundary)
             if start >= 0 and content.find('>', start) >= boundary:
                 boundary = start or content.find('>', start) + 1
