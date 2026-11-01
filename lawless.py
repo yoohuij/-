@@ -1,4 +1,4 @@
-"""Owner-configured, administrator-operated temporary text channel."""
+pass
 import asyncio
 from contextlib import closing
 
@@ -7,7 +7,7 @@ from discord import app_commands
 
 
 def opening_text(template, user):
-    # Only the selected user and the explicit everyone mention may notify.
+    
     return '|| @everyone ||\n' + discord.utils.escape_mentions(template).replace('{user}', user.mention)
 
 
@@ -50,7 +50,7 @@ class Lawless:
         return channel
 
     async def set_writable(self, channel, opened):
-        # One channel edit avoids leaving only some role overwrites updated.
+        
         overwrites = channel.overwrites
         everyone = overwrites.setdefault(channel.guild.default_role, discord.PermissionOverwrite())
         everyone.send_messages = opened
@@ -63,7 +63,7 @@ class Lawless:
             for name in ('send_messages', 'send_messages_in_threads'):
                 if getattr(overwrite, name) is not None:
                     setattr(overwrite, name, opened)
-            # Keep this feature's conversations in the main channel.
+            
             overwrite.create_public_threads = False
             overwrite.create_private_threads = False
         own = overwrites.setdefault(channel.guild.me, discord.PermissionOverwrite())
@@ -111,7 +111,7 @@ class Lawless:
                             raise ValueError('봇에 @everyone 멘션 권한이 필요합니다.')
                         await self.ensure_notice(channel, interaction.guild.id, config)
                         await self.set_writable(channel, True)
-                        # Persist before sending so failures/restarts remain closable.
+                        
                         config['is_open'] = 1
                         self.save(interaction.guild.id, config)
                         try:
@@ -124,7 +124,7 @@ class Lawless:
                             raise
                         result = f'{channel.mention} 무법지대를 열었습니다.'
                     else:
-                        # Lock first; retries after a partial deletion are safe.
+                        
                         await self.set_writable(channel, False)
                         config['is_open'] = 0
                         self.save(interaction.guild.id, config)
