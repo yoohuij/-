@@ -12,16 +12,16 @@ from discord import app_commands
 from dotenv import load_dotenv
 
 
-# .env를 실행 폴더가 아닌 bot.py와 동일한 폴더에서만 읽습니다.
+
 ENVIRONMENT_PATH = Path(__file__).resolve().with_name(".env")
 load_dotenv(ENVIRONMENT_PATH)
 
-# 로컬에서는 봇 파일 옆에 저장하고, Railway에서는 DATABASE_PATH(/data/...)를 사용합니다.
+
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", Path(__file__).resolve().with_name("attendance.sqlite3")))
 EMBED_LIMIT = 3_700
 MENTION_CHUNK_LIMIT = 1_850
 NOTICE_CONTENT_LIMIT = 1_800
-# Discord 임베드 필드 값은 최대 1,024자입니다.
+
 NOTICE_RESULT_LIMIT = 900
 NOTICE_RETRY_COUNT = 5
 
@@ -276,7 +276,7 @@ def get_approved_absences(guild_id: int) -> list[tuple[int, str]]:
 
 
 def get_absence_roster(guild_id: int) -> list[tuple[int, str]]:
-    """Merge live exemptions for display without recreating cleared reasons."""
+    pass
     roster = dict(get_approved_absences(guild_id))
     for user_id in get_notice_exemptions(guild_id):
         roster.setdefault(user_id, "예외 설정으로 자동 포함된 불참자입니다.")
@@ -284,7 +284,7 @@ def get_absence_roster(guild_id: int) -> list[tuple[int, str]]:
 
 
 def reset_absence_data(guild_id: int) -> tuple[int, int]:
-    """해당 서버의 승인 명단과 신청 자료를 한 트랜잭션으로 초기화합니다."""
+    pass
     with database() as connection:
         approved_count = connection.execute(
             "DELETE FROM approved_absences WHERE guild_id = ?", (guild_id,)
@@ -346,7 +346,7 @@ def filter_exception_mentions(chunk: str, guild_id: int) -> str:
 
 def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool) -> None:
     with database() as connection:
-        # 이전 대기 신청을 처리해 수동 제거 이후 다시 승인되는 것을 방지합니다.
+        
         connection.execute("DELETE FROM absence_requests WHERE guild_id = ? AND user_id = ?", (guild_id, user_id))
         if adding:
             connection.execute(
@@ -359,7 +359,7 @@ def set_manual_absence(guild_id: int, user_id: int, owner_id: int, adding: bool)
 
 
 def is_bot_administrator(guild_id: int, user_id: int) -> bool:
-    """서버 ID는 기존 호출 호환용이며, 권한은 봇 전체 명단에서 조회합니다."""
+    pass
     if is_suspended(user_id):
         return False
     with closing(database()) as connection:
@@ -411,7 +411,7 @@ def can_review_meeting(interaction: discord.Interaction) -> bool:
 
 
 def can_use_notice_admin(interaction: discord.Interaction) -> bool:
-    """봇 소유자, 서버 소유자 또는 지정된 공지 관리자만 공지 기능을 사용합니다."""
+    pass
     if is_suspended(interaction.user.id):
         return False
     return (
@@ -425,7 +425,7 @@ def can_use_notice_admin(interaction: discord.Interaction) -> bool:
 
 
 def is_owner(interaction: discord.Interaction) -> bool:
-    """봇 애플리케이션 소유자와 현재 서버 소유자를 모두 소유주로 취급합니다."""
+    pass
     return (
         interaction.guild is not None
         and (
@@ -466,7 +466,7 @@ async def get_non_responders(
 
 
 def safe_name(member: discord.Member) -> str:
-    # '<@123>'처럼 해석될 수 있는 문자열도 일반 텍스트로 표시합니다.
+    
     return discord.utils.escape_markdown(discord.utils.escape_mentions(member.display_name))
 
 
@@ -490,7 +490,7 @@ def make_pages(members: list[discord.Member]) -> list[str]:
 
 
 def make_mention_pages(members: list[discord.Member]) -> list[str]:
-    """알림을 보내지 않는 실패 인원 멘션 목록을 임베드 페이지 크기로 나눕니다."""
+    pass
     if not members:
         return ["없음"]
 
@@ -510,24 +510,24 @@ def make_mention_pages(members: list[discord.Member]) -> list[str]:
 
 
 async def send_direct_notice(member: discord.Member, notice: str) -> bool | None:
-    """DM 차단은 즉시 포기하고, 제한·일시 오류만 제한적으로 재시도합니다."""
+    pass
     for attempt in range(NOTICE_RETRY_COUNT):
         if member.id in get_notice_exemptions(member.guild.id) or any(r.id in get_exemption_roles(member.guild.id) for r in member.roles):
             return None
         try:
             await member.send(
                 notice,
-                # 공지 내용에 들어 있는 @everyone, 역할, 다른 사용자 멘션은 알리지 않습니다.
+                
                 allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
             )
             return True
         except (discord.Forbidden, discord.NotFound):
-            # 사용자가 서버 DM을 차단했거나 탈퇴한 경우: 즉시 실패 처리합니다.
+            
             return False
         except discord.HTTPException as error:
             status = getattr(error, "status", None)
-            # discord.py는 대부분의 429 제한을 내부에서 기다린 뒤 처리합니다.
-            # 그래도 제한(429) 또는 Discord의 일시 서버 오류(5xx)가 전달되면 재시도합니다.
+            
+            
             should_retry = status == 429 or (isinstance(status, int) and status >= 500)
             if not should_retry or attempt == NOTICE_RETRY_COUNT - 1:
                 return False
@@ -573,7 +573,7 @@ class ResultView(discord.ui.View):
         embed.add_field(name="선택 이모지", value=emoji_label, inline=True)
         embed.add_field(name="회의방 대상 인원 (예외 제외)", value=f"{self.total_members}명", inline=True)
         embed.add_field(name="미반응자", value=f"{len(self.members)}명", inline=True)
-        # 목록은 3,700자까지 나뉘므로 1,024자 제한의 필드 대신 본문에 표시합니다.
+        
         embed.description = self.pages[self.page]
         embed.set_footer(text=f"페이지 {self.page + 1}/{len(self.pages)} · 목록에서는 멘션되지 않습니다.")
         return embed
@@ -608,7 +608,7 @@ class ResultView(discord.ui.View):
 
     @discord.ui.button(label="미반응자 멘션", style=discord.ButtonStyle.danger)
     async def mention(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-        # 실제 알림은 이 버튼을 눌렀을 때만, 일반 채널 메시지로 보냅니다.
+        
         await interaction.response.defer(ephemeral=True)
         try:
             self.target = get_target(self.guild.id) or self.target
@@ -660,7 +660,7 @@ def make_member_pages(members: list[discord.Member], empty_message: str) -> list
 
 
 class MemberResultView(discord.ui.View):
-    """회의 미참여자·잠수 의심자처럼 특정 멤버 목록을 보여주고 멘션합니다."""
+    pass
 
     def __init__(
         self,
@@ -984,7 +984,7 @@ admin_group = app_commands.Group(name="관리자", description="공지용 봇 �
 async def on_voice_state_update(
     member: discord.Member, before: discord.VoiceState, after: discord.VoiceState
 ) -> None:
-    """등록된 회의방의 입장·퇴장을 등록된 로그방으로 기록합니다."""
+    pass
     if member.bot or member.guild is None:
         return
     if meeting_phase(member.guild.id) != "active":
@@ -994,7 +994,7 @@ async def on_voice_state_update(
         return
     was_in_meeting = before.channel is not None and before.channel.id == settings.meeting_channel_id
     is_in_meeting = after.channel is not None and after.channel.id == settings.meeting_channel_id
-    # 같은 회의방에서의 음소거, 화면공유 등의 상태 변화는 로그로 남기지 않습니다.
+    
     if was_in_meeting == is_in_meeting:
         return
     log_channel = bot.get_channel(settings.log_channel_id)
@@ -1238,7 +1238,7 @@ async def collect_reacted_ids(message):
 
 
 async def find_guild_message(guild, preferred_channel, message_id):
-    """Message IDs do not contain a channel ID; search readable server channels."""
+    pass
     seen = set()
 
     async def lookup(channel):
@@ -1259,7 +1259,7 @@ async def find_guild_message(guild, preferred_channel, message_id):
         message = await lookup(candidate)
         if message is not None:
             return message
-    # Archived threads are not included in the guild's active thread cache.
+    
     for parent in guild.channels:
         if not hasattr(parent, "archived_threads"):
             continue
@@ -1284,7 +1284,7 @@ async def get_idle_members(guild, channel, message_id):
     meeting_channel_id = get_meeting_settings(guild.id).meeting_channel_id
     if meeting_channel_id is None:
         raise ValueError("회의방이 등록되지 않았습니다.")
-    # Always fetch again: an earlier result must not be reused for a mention.
+    
     message = await find_guild_message(guild, channel, message_id)
     reacted_ids = await collect_reacted_ids(message)
     members = await get_meeting_members(guild, meeting_channel_id, include_excluded=True)
@@ -1433,7 +1433,7 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
     total_members = 0
     exempt_count = 0
 
-    # fetch_members로 캐시에 없는 현재 서버 멤버도 포함합니다.
+    
     async for member in interaction.guild.fetch_members(limit=None):
         if member.bot:
             continue
@@ -1450,7 +1450,7 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
             sent_count += 1
         else:
             failed_members.append(member)
-        # 짧은 간격만 두고, Discord의 실제 제한은 라이브러리가 처리합니다.
+        
         await asyncio.sleep(0.1)
 
     failed_count = len(failed_members)
@@ -1467,7 +1467,7 @@ async def send_notice(interaction: discord.Interaction, 내용: str) -> None:
         await interaction.followup.send(
             embed=embed,
             ephemeral=True,
-            # 실패 목록은 보기용이며, 실패한 사람에게 다시 알리지 않습니다.
+            
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
@@ -1899,7 +1899,7 @@ async def process_meeting_state(interaction: discord.Interaction, starting: bool
                 logging.getLogger(__name__).exception("회의 종료 정리 실패")
                 await interaction.followup.send("회의방 퇴장 또는 채팅 청소·잠금을 완료하지 못해 종료를 중단했습니다. 일부 작업은 이미 반영됐을 수 있습니다. 채널 관리·멤버 이동 등 봇 권한을 확인한 뒤 /회의 종료를 다시 실행해 주세요.", ephemeral=True)
                 return
-        # 송신 중에도 시작/종료 상태가 적용되며, 실패하면 이전 상태로 복구합니다.
+        
         set_meeting_phase(guild_id, "active" if starting else "ended")
         message = await channel.send(
             content="|| @everyone ||\n# 회의가 시작되었습니다" if starting else "회의가 종료되었습니다",
@@ -1950,7 +1950,7 @@ def nickname_database():
 
 
 def clean_nickname_base(value):
-    """Leading role blocks (including nested legacy blocks) are not personal names."""
+    pass
     value = (value or "").strip()
     while value.startswith(("『", "』")):
         if value.startswith("』"):
@@ -1976,7 +1976,7 @@ def nickname_role_prefix(role):
 
 
 def role_nickname(member, excluded, history, saved_prefixes=()):
-    """Rebuild exactly one role block; repair legacy duplicated bases too."""
+    pass
     role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
     base = member.nick
     if history:
@@ -1984,8 +1984,8 @@ def role_nickname(member, excluded, history, saved_prefixes=()):
         if base == applied:
             base = old_base
         else:
-            # Remember every prefix applied to THIS member, including renamed/deleted roles.
-            # Never remove arbitrary brackets or another member's role-like personal nickname.
+            
+            
             known = sorted({p for p in (*saved_prefixes, prefix) if p}, key=len, reverse=True)
             while base and base != old_base:
                 matched = next((p for p in known if base.startswith(p)), None)
@@ -2065,7 +2065,7 @@ async def run_nickname_updates(guild):
         while pending:
             user_id = pending.pop()
             async with nickname_locks.setdefault(guild.id, asyncio.Lock()):
-                # Read current cache after the lock, not the stale event snapshot.
+                
                 member, me = guild.get_member(user_id), guild.me
                 if (member is None or me is None or member.bot or member.id in get_notice_exemptions(guild.id) or member.id == guild.owner_id
                     or not me.guild_permissions.manage_nicknames or member.top_role >= me.top_role):
@@ -2102,7 +2102,7 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     await antiraid_feature.enforce(after)
     if is_suspended(after.id):
         return
-    # Nickname-only updates include this bot's own edits: never loop on those.
+    
     if {r.id for r in before.roles} != {r.id for r in after.roles}:
         queue_nickname_updates(after.guild, [after])
         category_feature.queue(after.guild, after)
@@ -2147,7 +2147,7 @@ async def on_guild_role_create(role: discord.Role):
 @bot.event
 async def on_ready():
     voice_activity_feature.start()
-    # Reconcile changes that happened while offline; no repeated API calls for matching nicknames.
+    
     for guild in bot.guilds:
         queue_nickname_updates(guild, guild.members)
         category_feature.queue(guild)
@@ -2292,7 +2292,7 @@ async def apply_role_nicknames(interaction: discord.Interaction):
                 counts["동일"] += 1
                 continue
             try:
-                # discord.py handles Discord's rate limits; do not bypass them.
+                
                 await asyncio.wait_for(member.edit(nick=target, reason=f"역할닉설정: {interaction.user.id}"), timeout=60)
             except (discord.HTTPException, asyncio.TimeoutError):
                 counts["실패"] += 1
@@ -2331,7 +2331,7 @@ deputy_feature = deputies.install(bot, database, is_bot_administrator)
 import voice_activity
 voice_activity_feature = voice_activity.install(bot, database, can_use_notice_admin)
 
-# Discord requires a non-empty description for slash commands and their options.
+
 for command in bot.tree.walk_commands():
     command.description = '·'
     if isinstance(command, app_commands.Command):
