@@ -973,7 +973,7 @@ class AttendanceBot(discord.Client):
         self.add_view(MeetingAnnouncementView())
         for request_id, message_id in get_pending_request_message_ids():
             self.add_view(AbsenceDecisionView(request_id), message_id=message_id)
-        await self.tree.sync()
+        await request_safety_feature.sync_commands()
 
 
 bot = AttendanceBot()
@@ -2184,15 +2184,28 @@ async def on_guild_role_create(role: discord.Role):
 @bot.event
 async def on_ready():
     voice_activity_feature.start()
-    
+    request_safety_feature.schedule_startup(run_startup_updates)
+
+
+async def run_startup_updates():
     for guild in bot.guilds:
-        queue_nickname_updates(guild, guild.members)
         category_feature.queue(guild)
-    async with donation_feature.lock:
-        problems = await donation_feature.sync_all_rank_roles()
-        if problems:
-            import logging
-            logging.getLogger(__name__).warning('%s', '\n'.join(problems))
+        worker = category_feature.workers.get(guild.id)
+        if worker is not None:
+            await worker
+        await asyncio.sleep(5)
+        queue_nickname_updates(guild, guild.members)
+        worker = nickname_workers.get(guild.id)
+        if worker is not None:
+            await worker
+        await asyncio.sleep(5)
+    for guild_id in donation_feature.role_guilds():
+        async with donation_feature.lock:
+            try:
+                await donation_feature.update_rank_roles(guild_id)
+            except (ValueError, discord.HTTPException):
+                logging.getLogger(__name__).warning('시작 후원 역할 갱신 실패: %s', guild_id)
+        await asyncio.sleep(5)
 
 
 def nickname_exception_ids(guild_id: int) -> list[int]:
@@ -2347,6 +2360,9 @@ async def apply_role_nicknames(interaction: discord.Interaction):
 bot.tree.add_command(meeting_group)
 bot.tree.add_command(admin_group)
 
+import request_safety
+request_safety_feature = request_safety.install(bot, database)
+
 import antiraid
 antiraid_feature = antiraid.install(bot, database, is_owner)
 
@@ -2375,8 +2391,18 @@ for command in bot.tree.walk_commands():
         app_commands.describe(**{p.name: '·' for p in command.parameters})(command)
 
 
+async def run_bot(token):
+    async with bot:
+        await request_safety_feature.wait_to_start()
+        await bot.start(token)
+
+
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token or token == "붙여넣을_봇_토큰":
         raise RuntimeError(f"{ENVIRONMENT_PATH} 파일에 DISCORD_TOKEN을 설정해 주세요.")
-    bot.run(token)
+    discord.utils.setup_logging()
+    try:
+        asyncio.run(run_bot(token))
+    except KeyboardInterrupt:
+        pass
