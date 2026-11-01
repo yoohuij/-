@@ -23,9 +23,10 @@ def category_memberships(roles, category_ids):
 
 
 class RoleCategories:
-    def __init__(self, bot, database, get_exemptions=None):
+    def __init__(self, bot, database, get_exemptions=None, get_exemption_roles=None):
         self.bot, self.database = bot, database
         self.get_exemptions = get_exemptions or (lambda guild_id: set())
+        self.get_exemption_roles = get_exemption_roles or (lambda guild_id: set())
         self.pending = {}
         self.full = set()
         self.workers = {}
@@ -72,7 +73,8 @@ class RoleCategories:
                 role = guild.get_role(rid)
                 if role is None or role.managed or role >= me.top_role:
                     continue
-                wanted = member.id not in self.get_exemptions(guild.id) and bool(held & children)
+                exempt = member.id in self.get_exemptions(guild.id) or bool(held & self.get_exemption_roles(guild.id))
+                wanted = not exempt and bool(held & children)
                 if wanted == (rid in held):
                     continue
                 try:
@@ -106,8 +108,8 @@ class RoleCategories:
             self.workers.pop(guild.id, None)
 
 
-def install(bot, database, is_owner, get_exemptions=None):
-    feature = RoleCategories(bot, database, get_exemptions)
+def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=None):
+    feature = RoleCategories(bot, database, get_exemptions, get_exemption_roles)
 
     @bot.tree.command(name='역할카테고리설정', description='·')
     @app_commands.guild_only()
@@ -124,6 +126,9 @@ def install(bot, database, is_owner, get_exemptions=None):
         guild = interaction.guild
         roles = {r.id: r for r in (역할1, 역할2, 역할3, 역할4, 역할5, 역할6, 역할7, 역할8, 역할9, 역할10) if r is not None}
         add = 동작.value == 'add'
+        if add and set(roles) & feature.get_exemption_roles(guild.id):
+            await interaction.response.send_message('예외 역할은 자동 카테고리로 등록할 수 없습니다.', ephemeral=True)
+            return
         if any(r.guild.id != guild.id or r.is_default() for r in roles.values()):
             await interaction.response.send_message('현재 서버의 @everyone 이외 역할을 선택해 주세요.', ephemeral=True)
             return
