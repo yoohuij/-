@@ -1,4 +1,4 @@
-"""Server-scoped category roles, bounded by the next category in role order."""
+pass
 import asyncio
 import logging
 from contextlib import closing
@@ -8,7 +8,7 @@ from discord import app_commands
 
 
 def category_memberships(roles, category_ids):
-    """guild.roles is Discord's authoritative low-to-high hierarchy order."""
+    pass
     groups = {}
     current = None
     for role in reversed(roles):
@@ -59,7 +59,7 @@ class RoleCategories:
             self.workers[guild.id] = asyncio.create_task(self.run(guild))
 
     async def reconcile(self, guild, member):
-        # Re-read configuration and cached membership after taking the lock.
+        
         async with self.locks.setdefault(guild.id, asyncio.Lock()):
             member = guild.get_member(member.id) or member
             me = guild.me
@@ -93,7 +93,7 @@ class RoleCategories:
             while guild.id in self.full or self.pending.get(guild.id):
                 if guild.id in self.full:
                     self.full.discard(guild.id)
-                    # REST enumeration avoids silently missing uncached members.
+                    
                     members = [m async for m in guild.fetch_members(limit=None)]
                 else:
                     ids = self.pending.pop(guild.id, set())
