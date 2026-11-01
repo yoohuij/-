@@ -2,10 +2,8 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 import time
 from contextlib import closing
-from email.utils import parsedate_to_datetime
 
 import discord
 from discord.webhook.async_ import AsyncWebhookAdapter, async_context
@@ -25,7 +23,7 @@ class RequestSafety:
         self.next_write = 0.0
         with closing(database()) as db, db:
             db.execute('CREATE TABLE IF NOT EXISTS request_safety (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
-        self.blocked_until = float(self.get('blocked_until') or 0)
+            db.execute("DELETE FROM request_safety WHERE key='blocked_until'")
         self.original_request = bot.http.request
         bot.http.request = self.request
         adapter = AsyncWebhookAdapter()
@@ -42,24 +40,8 @@ class RequestSafety:
         with closing(self.database()) as db, db:
             db.execute('INSERT OR REPLACE INTO request_safety VALUES (?,?)', (key, str(value)))
 
-    def remaining(self):
-        return max(0.0, self.blocked_until - time.time())
-
-    def retry_delay(self, response):
-        value = response.headers.get('Retry-After', '')
-        try:
-            delay = float(value)
-        except (ValueError, TypeError):
-            try:
-                delay = parsedate_to_datetime(value).timestamp() - time.time()
-            except (ValueError, TypeError, OverflowError):
-                delay = 0
-        return max(900.0, delay) if math.isfinite(delay) else 900.0
-
     async def wait_to_start(self):
-        while self.remaining() > 0:
-            LOG.warning('요청 제한 보호 대기: 약 %s초. 서버의 실제 제한 해제 시간은 별도입니다.', math.ceil(self.remaining()))
-            await asyncio.sleep(min(60, self.remaining()))
+        return
 
     async def request(self, route, **kwargs):
         return await self.dispatch(self.original_request, route, **kwargs)
@@ -68,14 +50,14 @@ class RequestSafety:
         return await self.dispatch(self.original_webhook_request, route, *args, **kwargs)
 
     async def dispatch(self, original, route, *args, **kwargs):
-        if self.tripped or self.remaining() > 0:
+        if self.tripped:
             raise RuntimeError('Discord 요청 제한 보호 중: 추가 전송을 중단했습니다.')
         reason = kwargs.get('reason') or ''
         if reason.startswith(('역할 카테고리', '하위 역할 없음', '예외 인원 또는', '역할 변경에 따른', '누적 후원', '후원 순위 변경', '후원 상위 3위')):
             async with self.pacing_lock:
                 await asyncio.sleep(max(0, self.next_write - time.monotonic()))
                 self.next_write = time.monotonic() + 1.0
-        if self.tripped or self.remaining() > 0:
+        if self.tripped:
             raise RuntimeError('Discord 요청 제한 보호 중: 추가 전송을 중단했습니다.')
         try:
             return await original(route, *args, **kwargs)
@@ -83,15 +65,10 @@ class RequestSafety:
             if exc.status != 429:
                 raise
             self.tripped = True
-            self.blocked_until = max(self.blocked_until, time.time() + self.retry_delay(exc.response))
-            try:
-                self.put('blocked_until', self.blocked_until)
-            except Exception:
-                LOG.exception('요청 제한 보호 시간 저장 실패')
-            LOG.error('Discord HTTP 429: 추가 요청 중단 및 봇 연결 종료. 최소 15분 보호 대기 후 재시작하세요. 제한 해제는 보장되지 않습니다.')
+            LOG.error('Discord HTTP 429: 추가 요청 중단 및 봇 연결 종료. 호스팅 제한 상태를 확인하고 반복 재시작하지 마세요.')
             if self.close_task is None:
                 self.close_task = asyncio.create_task(self.bot.close())
-            raise discord.HTTPException(exc.response, '요청 제한으로 봇 연결을 종료합니다. 보호 대기 후 재시작하세요.') from None
+            raise discord.HTTPException(exc.response, '요청 제한으로 봇 연결을 종료합니다. 호스팅 제한 상태를 확인해 주세요.') from None
 
     async def sync_commands(self):
         payload = [command.to_dict(self.bot.tree) for command in self.bot.tree.get_commands()]
