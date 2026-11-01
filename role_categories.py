@@ -23,6 +23,8 @@ def category_memberships(roles, category_ids):
 
 
 class RoleCategories:
+    table = 'role_categories'
+
     def __init__(self, bot, database, get_exemptions=None, get_exemption_roles=None):
         self.bot, self.database = bot, database
         self.get_exemptions = get_exemptions or (lambda guild_id: set())
@@ -31,24 +33,28 @@ class RoleCategories:
         self.full = set()
         self.workers = {}
         self.locks = {}
+        self.special = None
 
     def connect(self):
         db = self.database()
-        db.execute('CREATE TABLE IF NOT EXISTS role_categories (guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL, PRIMARY KEY(guild_id, role_id))')
+        db.execute(f'CREATE TABLE IF NOT EXISTS {self.table} (guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL, PRIMARY KEY(guild_id, role_id))')
+        db.execute('CREATE TABLE IF NOT EXISTS special_category_end (guild_id INTEGER PRIMARY KEY, role_id INTEGER NOT NULL)')
         db.commit()
         return db
 
     def ids(self, guild_id):
         with closing(self.connect()) as db:
-            return {row[0] for row in db.execute('SELECT role_id FROM role_categories WHERE guild_id=?', (guild_id,))}
+            return {row[0] for row in db.execute(f'SELECT role_id FROM {self.table} WHERE guild_id=?', (guild_id,))}
 
     def configure(self, guild_id, role_ids, add):
         with closing(self.connect()) as db, db:
-            query = ('INSERT OR IGNORE INTO role_categories VALUES (?,?)' if add else
-                     'DELETE FROM role_categories WHERE guild_id=? AND role_id=?')
+            query = (f'INSERT OR IGNORE INTO {self.table} VALUES (?,?)' if add else
+                     f'DELETE FROM {self.table} WHERE guild_id=? AND role_id=?')
             db.executemany(query, [(guild_id, rid) for rid in role_ids])
 
     def queue(self, guild, member=None):
+        if self.special is not None:
+            self.special.queue(guild, member)
         if not self.ids(guild.id):
             return
         if member is None:
@@ -67,7 +73,7 @@ class RoleCategories:
                 return
             if member.id == guild.owner_id or member.top_role >= me.top_role:
                 return
-            groups = category_memberships(guild.roles, self.ids(guild.id))
+            groups = self.groups(guild)
             held = {r.id for r in member.roles}
             for rid, children in groups.items():
                 role = guild.get_role(rid)
@@ -87,6 +93,9 @@ class RoleCategories:
                         await member.remove_roles(role, reason='예외 인원 또는 하위 역할 없음: 카테고리 자동 회수')
                 except discord.HTTPException:
                     logging.getLogger(__name__).exception('카테고리 갱신 실패: guild=%s user=%s role=%s', guild.id, member.id, rid)
+
+    def groups(self, guild):
+        return category_memberships(guild.roles, self.ids(guild.id))
 
     async def run(self, guild):
         try:
@@ -108,8 +117,42 @@ class RoleCategories:
             self.workers.pop(guild.id, None)
 
 
+class SpecialRoleCategories(RoleCategories):
+    table = 'special_role_categories'
+
+    def end_id(self, guild_id):
+        with closing(self.connect()) as db:
+            row = db.execute('SELECT role_id FROM special_category_end WHERE guild_id=?', (guild_id,)).fetchone()
+        return row[0] if row else None
+
+    def set_end(self, guild_id, role_id):
+        with closing(self.connect()) as db, db:
+            db.execute('INSERT OR REPLACE INTO special_category_end VALUES (?,?)', (guild_id, role_id))
+
+    def groups(self, guild):
+        end_id = self.end_id(guild.id)
+        if end_id is None or guild.get_role(end_id) is None:
+            return {}
+        ids = self.ids(guild.id)
+        groups = {r.id: set() for r in reversed(guild.roles) if r.id in ids}
+        current = None
+        for role in reversed(guild.roles):
+            if role.id == end_id:
+                break
+            if role.is_default():
+                continue
+            if role.id in ids:
+                current = role.id
+            elif current is not None:
+                groups[current].add(role.id)
+        return groups
+
+
 def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=None):
     feature = RoleCategories(bot, database, get_exemptions, get_exemption_roles)
+    special = SpecialRoleCategories(bot, database, get_exemptions, get_exemption_roles)
+    feature.special = special
+    special.locks = feature.locks
 
     @bot.tree.command(name='역할카테고리설정', description='·')
     @app_commands.guild_only()
@@ -138,6 +181,9 @@ def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=No
             return
         await interaction.response.defer(ephemeral=True)
         async with feature.locks.setdefault(guild.id, asyncio.Lock()):
+            if add and (set(roles) & special.ids(guild.id) or special.end_id(guild.id) in roles):
+                await interaction.followup.send('특수 카테고리 또는 끝 표시 역할은 일반 카테고리와 겸용할 수 없습니다.', ephemeral=True)
+                return
             feature.configure(guild.id, roles, add)
         feature.queue(guild)
         note = ('등록한 역할의 기존 권한은 그대로이므로, 구분용 역할에 관리자 권한을 넣지 마세요.' if add else
@@ -159,5 +205,78 @@ def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=No
         for start in range(0, max(1, len(lines)), 20):
             await interaction.followup.send('\n'.join(lines[start:start + 20]) or '등록된 카테고리가 없습니다.',
                                             ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @bot.tree.command(name='특수카테고리설정', description='·')
+    @app_commands.guild_only()
+    @app_commands.choices(동작=[app_commands.Choice(name='추가', value='add'), app_commands.Choice(name='제거', value='remove')])
+    async def special_configure(interaction: discord.Interaction, 동작: app_commands.Choice[str],
+                                역할1: discord.Role, 역할2: discord.Role | None = None,
+                                역할3: discord.Role | None = None, 역할4: discord.Role | None = None,
+                                역할5: discord.Role | None = None, 역할6: discord.Role | None = None,
+                                역할7: discord.Role | None = None, 역할8: discord.Role | None = None,
+                                역할9: discord.Role | None = None, 역할10: discord.Role | None = None):
+        if not is_owner(interaction):
+            await interaction.response.send_message('봇 소유자 또는 서버 소유자만 사용할 수 있습니다.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        roles = {r.id: r for r in (역할1, 역할2, 역할3, 역할4, 역할5, 역할6, 역할7, 역할8, 역할9, 역할10) if r is not None}
+        add = 동작.value == 'add'
+        async with special.locks.setdefault(guild.id, asyncio.Lock()):
+            if any(r.guild.id != guild.id or r.is_default() for r in roles.values()):
+                await interaction.followup.send('현재 서버의 @everyone 이외 역할을 선택해 주세요.', ephemeral=True)
+                return
+            if add and (set(roles) & (feature.ids(guild.id) | special.get_exemption_roles(guild.id)) or special.end_id(guild.id) in roles):
+                await interaction.followup.send('일반 카테고리·예외 역할·끝 표시는 특수 카테고리로 겸용할 수 없습니다.', ephemeral=True)
+                return
+            if add and (guild.me is None or not guild.me.guild_permissions.manage_roles or any(r.managed or r >= guild.me.top_role for r in roles.values())):
+                await interaction.followup.send('역할 관리 권한과 봇보다 아래인 일반 역할을 확인해 주세요.', ephemeral=True)
+                return
+            end = guild.get_role(special.end_id(guild.id))
+            if add and end is not None and any(end >= r for r in roles.values()):
+                await interaction.followup.send('특수 카테고리는 끝 표시 역할보다 위에 있어야 합니다.', ephemeral=True)
+                return
+            special.configure(guild.id, roles, add)
+        special.queue(guild)
+        note = '끝 표시가 없거나 삭제됐으면 자동 갱신을 보류합니다. /마지막특수카테고리로 지정해 주세요.' if end is None else '특수 카테고리 전체 갱신을 예약했습니다.'
+        if not add:
+            note += '\n제거는 자동 관리 등록만 해제하며 이미 가진 역할은 유지합니다.'
+        await interaction.followup.send(('특수 카테고리를 누적 등록했습니다.' if add else '특수 카테고리 등록을 해제했습니다.') + '\n' + note, ephemeral=True)
+
+    @bot.tree.command(name='마지막특수카테고리', description='·')
+    @app_commands.guild_only()
+    async def special_end(interaction: discord.Interaction, 역할: discord.Role):
+        if not is_owner(interaction):
+            await interaction.response.send_message('봇 소유자 또는 서버 소유자만 사용할 수 있습니다.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        async with special.locks.setdefault(guild.id, asyncio.Lock()):
+            ids = special.ids(guild.id)
+            if 역할.guild.id != guild.id or 역할.is_default() or 역할.id in ids | feature.ids(guild.id):
+                await interaction.followup.send('현재 서버의 카테고리가 아닌 별도 끝 표시 역할을 선택해 주세요.', ephemeral=True)
+                return
+            if any(역할 >= r for r in guild.roles if r.id in ids):
+                await interaction.followup.send('끝 표시는 등록된 모든 특수 카테고리보다 아래에 있어야 합니다.', ephemeral=True)
+                return
+            special.set_end(guild.id, 역할.id)
+        special.queue(guild)
+        await interaction.followup.send(f'특수 카테고리 끝 표시: {역할.mention}\n이 역할 자체와 아래 역할은 특수 범위에서 제외합니다. 일반 카테고리 범위는 변경하지 않습니다.', ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+    @bot.tree.command(name='특수카테고리목록', description='·')
+    @app_commands.guild_only()
+    async def special_listing(interaction: discord.Interaction):
+        if not is_owner(interaction):
+            await interaction.response.send_message('봇 소유자 또는 서버 소유자만 사용할 수 있습니다.', ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        guild = interaction.guild
+        ids = special.ids(guild.id)
+        groups = special.groups(guild)
+        end = guild.get_role(special.end_id(guild.id))
+        lines = [f'{i}. {r.mention} — 하위 역할 {len(groups.get(r.id, set()))}개' for i, r in enumerate((r for r in reversed(guild.roles) if r.id in ids), 1)]
+        footer = f'끝 표시: {end.mention} (범위 제외)' if end else '끝 표시 없음/삭제됨: 자동 갱신 보류'
+        for start in range(0, max(1, len(lines)), 20):
+            await interaction.followup.send(('\n'.join(lines[start:start + 20]) or '등록된 특수 카테고리가 없습니다.') + '\n\n' + footer, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     return feature
