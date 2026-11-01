@@ -148,7 +148,7 @@ class SpecialRoleCategories(RoleCategories):
         return groups
 
 
-def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=None):
+def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=None, nickname_refresh=None):
     feature = RoleCategories(bot, database, get_exemptions, get_exemption_roles)
     special = SpecialRoleCategories(bot, database, get_exemptions, get_exemption_roles)
     feature.special = special
@@ -238,6 +238,8 @@ def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=No
                 return
             special.configure(guild.id, roles, add)
         special.queue(guild)
+        if nickname_refresh is not None:
+            nickname_refresh(guild, guild.members)
         note = '끝 표시가 없거나 삭제됐으면 자동 갱신을 보류합니다. /마지막특수카테고리로 지정해 주세요.' if end is None else '특수 카테고리 전체 갱신을 예약했습니다.'
         if not add:
             note += '\n제거는 자동 관리 등록만 해제하며 이미 가진 역할은 유지합니다.'
@@ -261,6 +263,8 @@ def install(bot, database, is_owner, get_exemptions=None, get_exemption_roles=No
                 return
             special.set_end(guild.id, 역할.id)
         special.queue(guild)
+        if nickname_refresh is not None:
+            nickname_refresh(guild, guild.members)
         await interaction.followup.send(f'특수 카테고리 끝 표시: {역할.mention}\n이 역할 자체와 아래 역할은 특수 범위에서 제외합니다. 일반 카테고리 범위는 변경하지 않습니다.', ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @bot.tree.command(name='특수카테고리목록', description='·')
