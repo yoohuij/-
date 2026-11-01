@@ -1,4 +1,4 @@
-"""Owner-configured meeting text-channel cleanup."""
+pass
 import asyncio
 import uuid
 from contextlib import closing
@@ -57,7 +57,7 @@ class MeetingChat:
             for user_id in list(channel.voice_states):
                 try:
                     member = channel.guild.get_member(user_id) or await channel.guild.fetch_member(user_id)
-                    # Do not disconnect someone who has moved to another channel.
+                    
                     if member.voice and member.voice.channel and member.voice.channel.id == channel.id:
                         await member.move_to(None, reason="회의 종료: 전체 퇴장")
                 except discord.NotFound:
@@ -97,7 +97,7 @@ class MeetingChat:
                 overwrite.create_private_threads = False
         own = overwrites.setdefault(channel.guild.me, discord.PermissionOverwrite())
         own.view_channel = own.read_message_history = own.send_messages = True
-        # Use the returned fresh object: clone must copy the locked overwrites.
+        
         return await channel.edit(overwrites=overwrites, reason="회의 종료: 채팅 잠금")
 
     async def cleanup(self, guild, settings):
@@ -107,7 +107,7 @@ class MeetingChat:
         async with asyncio.timeout(600):
             state = self.rotation(guild.id)
             if state and state["phase"] == "done":
-                return  # Retrying voice shutdown must not delete the new room again.
+                return  
             if state is None:
                 old = await self.validate(guild, cid, settings)
                 state = dict(old_id=cid, new_id=None, phase="creating",
@@ -118,7 +118,7 @@ class MeetingChat:
             if state["new_id"] is None:
                 old = await self.validate(guild, state["old_id"], settings)
                 old = await self.lock_channel(old)
-                # Recover a successful clone whose response/DB write was interrupted.
+                
                 matches = [c for c in await guild.fetch_channels()
                            if isinstance(c, discord.TextChannel) and c.name == state["marker"]]
                 if len(matches) > 1:
@@ -126,7 +126,7 @@ class MeetingChat:
                 new = matches[0] if matches else await old.clone(name=state["marker"], reason="회의 종료: 채팅방 교체")
                 state["new_id"] = new.id
                 state["phase"] = "created"
-                self.save_rotation(guild.id, state)  # Durable ID before renaming/deletion.
+                self.save_rotation(guild.id, state)  
             new = await self.validate(guild, state["new_id"], settings)
             new = await self.lock_channel(new)
             if state["phase"] == "created":
@@ -136,7 +136,7 @@ class MeetingChat:
                 state["phase"] = "prepared"
                 self.save_rotation(guild.id, state)
             if state["phase"] == "prepared":
-                # A missing old room is successful recovery after a delete/crash.
+                
                 try:
                     old = await self.validate(guild, state["old_id"], settings)
                 except discord.NotFound:
