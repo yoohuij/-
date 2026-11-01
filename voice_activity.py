@@ -1,4 +1,4 @@
-"""Server-wide voice count including bots, with a persistent display channel."""
+pass
 import asyncio
 import logging
 from contextlib import closing
@@ -105,7 +105,7 @@ def install(bot, database, manager_check):
                             overwrites={interaction.guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
                                         interaction.guild.me: discord.PermissionOverwrite(view_channel=True, manage_channels=True)},
                             reason='통방 활동률 표시 채널 생성')
-                        # Save before moving; retry cannot create a duplicate.
+                        
                         feature.save(interaction.guild.id, channel.id)
                     await channel.move(beginning=True, category=카테고리, sync_permissions=False,
                                        reason='카테고리 음성 채널 목록 맨 위로 이동')
