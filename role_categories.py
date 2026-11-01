@@ -94,7 +94,7 @@ class RoleCategories:
                 if guild.id in self.full:
                     self.full.discard(guild.id)
                     
-                    members = [m async for m in guild.fetch_members(limit=None)]
+                    members = list(guild.members) if guild.chunked else [m async for m in guild.fetch_members(limit=None)]
                 else:
                     ids = self.pending.pop(guild.id, set())
                     members = [guild.get_member(uid) for uid in ids]
