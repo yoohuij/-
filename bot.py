@@ -1533,22 +1533,59 @@ async def set_role_exception(interaction: discord.Interaction, 동작: app_comma
         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
+class ExceptionRosterView(discord.ui.View):
+    def __init__(self, owner_id, role_ids, user_ids, in_guild):
+        super().__init__(timeout=300)
+        self.owner_id = owner_id
+        self.role_ids = role_ids
+        self.user_ids = user_ids
+        self.in_guild = in_guild
+        self.page = 0
+        self.pages = max(1, (max(len(role_ids), len(user_ids)) + 19) // 20)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next_page.disabled = self.page == self.pages - 1
+
+    def embed(self):
+        start = self.page * 20
+        roles = "\n".join(f"{i}. <@&{rid}>" for i, rid in enumerate(self.role_ids[start:start + 20], start + 1))
+        users = "\n".join(f"{i}. <@{uid}>" for i, uid in enumerate(self.user_ids[start:start + 20], start + 1))
+        embed = discord.Embed(title="예외명단", colour=discord.Colour.blurple())
+        embed.add_field(name=f"지정 역할 · 현재 서버 ({len(self.role_ids)}개)", value=roles or ("이 페이지에 표시할 역할이 없습니다." if self.in_guild else "서버에서 확인해 주세요."), inline=False)
+        embed.add_field(name=f"개인 지정 · 봇 전체 ({len(self.user_ids)}명)", value=users or "이 페이지에 표시할 인원이 없습니다.", inline=False)
+        embed.set_footer(text=f"페이지 {self.page + 1}/{self.pages}")
+        return embed
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.owner_id or is_suspended(interaction.user.id):
+            await interaction.response.send_message("이 목록을 조작할 권한이 없습니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="이전", style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction, button):
+        self.page = max(0, self.page - 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label="다음", style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction, button):
+        self.page = min(self.pages - 1, self.page + 1)
+        self.update_buttons()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
 @bot.tree.command(name="예외목록", description="봇 전체 예외 명단을 나에게만 표시합니다.")
 async def list_global_exceptions(interaction: discord.Interaction) -> None:
     if not await exception_permission(interaction):
         return
     await interaction.response.defer(ephemeral=True)
     ids = sorted(get_notice_exemptions(0))
-    if interaction.guild is not None:
-        role_ids = sorted(get_exemption_roles(interaction.guild.id))
-        for offset in range(0, max(1, len(role_ids)), 20):
-            lines = "\n".join(f"• <@&{rid}>" for rid in role_ids[offset:offset + 20]) or "등록된 예외 역할이 없습니다."
-            await interaction.followup.send(embed=discord.Embed(title="현재 서버 예외 역할", description=lines, colour=discord.Colour.blurple()), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
-    for offset in range(0, max(1, len(ids)), 20):
-        page = "\n".join(f"• <@{uid}>" for uid in ids[offset:offset + 20]) or "등록된 예외 인원이 없습니다."
-        embed = discord.Embed(title="봇 전체 예외 명단", description=page, colour=discord.Colour.blurple())
-        embed.set_footer(text=f"총 {len(ids)}명 · {offset // 20 + 1}페이지")
-        await interaction.followup.send(embed=embed, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+    role_ids = sorted(get_exemption_roles(interaction.guild.id)) if interaction.guild is not None else []
+    view = ExceptionRosterView(interaction.user.id, role_ids, ids, interaction.guild is not None)
+    await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
 
 @admin_group.command(name="부여", description="유저에게 공지용 봇 관리자 권한을 부여합니다.")
