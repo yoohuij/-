@@ -1,4 +1,4 @@
-"""Server-scoped limited meeting reviewers, independent of administrators."""
+pass
 from contextlib import closing
 import discord
 from discord import app_commands
