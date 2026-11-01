@@ -298,12 +298,23 @@ def get_pending_request_message_ids() -> list[tuple[int, int]]:
     return [(int(request_id), int(message_id)) for request_id, message_id in rows]
 
 
+def get_exemption_roles(guild_id: int) -> set[int]:
+    with closing(database()) as connection, connection:
+        connection.execute("CREATE TABLE IF NOT EXISTS role_exemptions (guild_id INTEGER NOT NULL, role_id INTEGER NOT NULL, PRIMARY KEY(guild_id, role_id))")
+        return {row[0] for row in connection.execute("SELECT role_id FROM role_exemptions WHERE guild_id=?", (guild_id,))}
+
+
 def get_notice_exemptions(guild_id: int) -> set[int]:
     with closing(database()) as connection:
         rows = connection.execute(
             "SELECT user_id FROM global_exemptions ORDER BY user_id"
         ).fetchall()
-    return {row[0] for row in rows}
+    ids = {row[0] for row in rows}
+    guild = bot.get_guild(guild_id)
+    if guild is not None:
+        role_ids = get_exemption_roles(guild_id)
+        ids.update(member.id for member in guild.members if any(role.id in role_ids for role in member.roles))
+    return ids
 
 
 def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
@@ -320,8 +331,8 @@ def set_notice_exemption(guild_id: int, user_id: int, is_exempt: bool) -> None:
             )
 
 
-def filter_exception_mentions(chunk: str) -> str:
-    exempt_ids = get_notice_exemptions(0)
+def filter_exception_mentions(chunk: str, guild_id: int) -> str:
+    exempt_ids = get_notice_exemptions(guild_id)
     return " ".join(token for token in chunk.split() if int(token.strip("<@!>")) not in exempt_ids)
 
 
@@ -493,7 +504,7 @@ def make_mention_pages(members: list[discord.Member]) -> list[str]:
 async def send_direct_notice(member: discord.Member, notice: str) -> bool | None:
     """DM 차단은 즉시 포기하고, 제한·일시 오류만 제한적으로 재시도합니다."""
     for attempt in range(NOTICE_RETRY_COUNT):
-        if member.id in get_notice_exemptions(0):
+        if member.id in get_notice_exemptions(member.guild.id) or any(r.id in get_exemption_roles(member.guild.id) for r in member.roles):
             return None
         try:
             await member.send(
@@ -611,7 +622,7 @@ class ResultView(discord.ui.View):
             chunks.append(" ".join(current))
 
         for index, chunk in enumerate(chunks, start=1):
-            chunk = filter_exception_mentions(chunk)
+            chunk = filter_exception_mentions(chunk, interaction.guild.id)
             if not chunk:
                 continue
             await interaction.channel.send(
@@ -767,7 +778,7 @@ class MemberResultView(discord.ui.View):
             chunks.append(" ".join(current))
         if interaction.channel is not None:
             for chunk in chunks:
-                chunk = filter_exception_mentions(chunk)
+                chunk = filter_exception_mentions(chunk, interaction.guild.id)
                 if not chunk:
                     continue
                 await interaction.channel.send(
@@ -1483,12 +1494,45 @@ async def set_global_exception(
     )
 
 
+@bot.tree.command(name="예외설정역할", description="·")
+@app_commands.guild_only()
+@app_commands.choices(동작=[app_commands.Choice(name="추가", value="add"), app_commands.Choice(name="제거", value="remove")])
+async def set_role_exception(interaction: discord.Interaction, 동작: app_commands.Choice[str], 역할: discord.Role) -> None:
+    if not await exception_permission(interaction):
+        return
+    guild = interaction.guild
+    adding = 동작.value == "add"
+    if 역할.guild.id != guild.id or 역할.is_default():
+        await interaction.response.send_message("현재 서버의 @everyone 이외 역할을 선택해 주세요.", ephemeral=True)
+        return
+    if adding and 역할.id in category_feature.ids(guild.id):
+        await interaction.response.send_message("자동 회수되는 카테고리 역할 자체는 예외 역할로 지정할 수 없습니다. 별도 역할을 선택해 주세요.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    get_exemption_roles(guild.id)
+    with closing(database()) as connection, connection:
+        if adding:
+            connection.execute("INSERT OR IGNORE INTO role_exemptions VALUES (?,?)", (guild.id, 역할.id))
+        else:
+            connection.execute("DELETE FROM role_exemptions WHERE guild_id=? AND role_id=?", (guild.id, 역할.id))
+    category_feature.queue(guild)
+    queue_nickname_updates(guild, guild.members)
+    await interaction.followup.send(
+        f"{역할.mention} 역할 예외를 {'추가' if adding else '제거'}했습니다. 이 서버에서 적용되며 개인 예외는 유지됩니다.",
+        ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+
+
 @bot.tree.command(name="예외목록", description="봇 전체 예외 명단을 나에게만 표시합니다.")
 async def list_global_exceptions(interaction: discord.Interaction) -> None:
     if not await exception_permission(interaction):
         return
     await interaction.response.defer(ephemeral=True)
     ids = sorted(get_notice_exemptions(0))
+    if interaction.guild is not None:
+        role_ids = sorted(get_exemption_roles(interaction.guild.id))
+        for offset in range(0, max(1, len(role_ids)), 20):
+            lines = "\n".join(f"• <@&{rid}>" for rid in role_ids[offset:offset + 20]) or "등록된 예외 역할이 없습니다."
+            await interaction.followup.send(embed=discord.Embed(title="현재 서버 예외 역할", description=lines, colour=discord.Colour.blurple()), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
     for offset in range(0, max(1, len(ids)), 20):
         page = "\n".join(f"• <@{uid}>" for uid in ids[offset:offset + 20]) or "등록된 예외 인원이 없습니다."
         embed = discord.Embed(title="봇 전체 예외 명단", description=page, colour=discord.Colour.blurple())
@@ -2265,7 +2309,7 @@ import donations
 donation_feature = donations.install(bot, database, is_bot_administrator)
 
 import role_categories
-category_feature = role_categories.install(bot, database, is_owner, get_notice_exemptions)
+category_feature = role_categories.install(bot, database, is_owner, get_notice_exemptions, get_exemption_roles)
 
 import lawless
 lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
