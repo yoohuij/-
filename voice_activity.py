@@ -71,6 +71,7 @@ class VoiceActivity:
     @refresh.before_loop
     async def before_refresh(self):
         await self.bot.wait_until_ready()
+        await asyncio.sleep(30)
 
     def start(self):
         if not self.refresh.is_running():
