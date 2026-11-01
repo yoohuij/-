@@ -275,6 +275,14 @@ def get_approved_absences(guild_id: int) -> list[tuple[int, str]]:
     return [(int(user_id), str(reason)) for user_id, reason in rows]
 
 
+def get_absence_roster(guild_id: int) -> list[tuple[int, str]]:
+    """Merge live exemptions for display without recreating cleared reasons."""
+    roster = dict(get_approved_absences(guild_id))
+    for user_id in get_notice_exemptions(guild_id):
+        roster.setdefault(user_id, "예외 설정으로 자동 포함된 불참자입니다.")
+    return sorted(roster.items())
+
+
 def reset_absence_data(guild_id: int) -> tuple[int, int]:
     """해당 서버의 승인 명단과 신청 자료를 한 트랜잭션으로 초기화합니다."""
     with database() as connection:
@@ -1154,9 +1162,9 @@ async def approved_absence_list(interaction: discord.Interaction) -> None:
     if not can_review_meeting(interaction):
         await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
         return
-    pages = make_absence_pages(get_approved_absences(interaction.guild.id))
+    pages = make_absence_pages(get_absence_roster(interaction.guild.id))
     for index, page in enumerate(pages, start=1):
-        embed = discord.Embed(title="승인된 불참자 명단", description=page, colour=discord.Colour.gold())
+        embed = discord.Embed(title="불참자 명단 · 예외자 포함", description=page, colour=discord.Colour.gold())
         if len(pages) > 1:
             embed.set_footer(text=f"페이지 {index}/{len(pages)}")
         if index == 1:
@@ -1179,6 +1187,9 @@ async def check_absence_reason(interaction: discord.Interaction, 유저: discord
         await interaction.response.send_message("서버 관리 권한이 필요합니다.", ephemeral=True)
         return
     reason = get_approved_absence(interaction.guild.id, 유저.id)
+    if reason is None and (유저.id in get_notice_exemptions(interaction.guild.id)
+                           or any(role.id in get_exemption_roles(interaction.guild.id) for role in 유저.roles)):
+        reason = "예외 설정으로 자동 포함된 불참자입니다."
     if reason is None:
         await interaction.response.send_message("불참자가 아닙니다.", ephemeral=True)
         return
