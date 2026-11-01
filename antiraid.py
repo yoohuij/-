@@ -1,4 +1,4 @@
-"""Audit-log based, opt-in server protection with durable backups and suspensions."""
+pass
 import asyncio
 import json
 import logging
@@ -114,7 +114,7 @@ class AntiRaid:
                                allowed_mentions=discord.AllowedMentions.none())
         except (discord.HTTPException, ValueError):
             LOG.exception("보안 로그 전송 실패: 사건 %s", incident_id)
-            # Incident remains in DB even if the channel or bot permissions are lost.
+            
 
     def count_event(self, entry, kind):
         now = time.time()
@@ -126,11 +126,11 @@ class AntiRaid:
                 (entry.id,entry.guild.id,entry.user_id,entry.target.id,kind,stamp))
             if not cur.rowcount:
                 return None
-            # Event timestamps, not arrival spacing; handle reordered gateway delivery.
+            
             rows = db.execute("SELECT target,kind,stamp FROM raid_events WHERE guild_id=? AND actor=? AND stamp BETWEEN ? AND ?",
                               (entry.guild.id,entry.user_id,stamp-WINDOW,stamp+WINDOW)).fetchall()
             db.execute("DELETE FROM raid_events WHERE stamp < ?", (now-120,))
-        # Evaluate every window including the current event.
+        
         for end in sorted({r[2] for r in rows if r[2]>=stamp}):
             window = [r for r in rows if end-WINDOW <= r[2] <= end]
             deleted = len({(r[0],r[1]) for r in window if r[1]=="delete"})
@@ -147,7 +147,7 @@ class AntiRaid:
             saved = set(json.loads(row[0])) if row else set()
             saved.update(r.id for r in roles)
             db.execute("INSERT OR REPLACE INTO raid_suspects VALUES (?,?,?,1)", (*key,json.dumps(sorted(saved))))
-        self.suspended.add(key)  # Durable suspension before any Discord mutations.
+        self.suspended.add(key)  
         failures = []
         for role in roles:
             if role.managed or role >= member.guild.me.top_role:
@@ -187,7 +187,7 @@ class AntiRaid:
         kind = event_kind(entry)
         if not kind or self.backup(entry.guild.id) is None:
             return
-        # Only this bot's own operations are exempt, not arbitrary bot accounts.
+        
         if entry.user_id == getattr(self.bot.user,"id",None):
             return
         async with self.actor_locks.setdefault((entry.guild.id,entry.user_id),asyncio.Lock()):
@@ -363,10 +363,10 @@ class AntiRaid:
                 await channel.edit(position=c["position"],reason="백업 채널 위치 복구")
             except discord.HTTPException:
                 errors.append(f"채널 {c['name']} 복구 실패")
-        # Add missing roles; never kick users or remove roles added after the backup.
+        
         for uid,role_ids in data["members"].items():
             if self.blocked(int(uid)):
-                continue  # /복구 must never undo a suspect suspension.
+                continue  
             try:
                 member=await guild.fetch_member(int(uid))
                 desired=[current_roles[maps["roles"].get(str(rid),rid)] for rid in role_ids
@@ -374,15 +374,15 @@ class AntiRaid:
                 desired=[r for r in desired if r not in member.roles and not r.managed and r < guild.me.top_role]
                 if desired: await member.add_roles(*desired,reason="백업 멤버 역할 복구")
             except discord.NotFound:
-                continue  # Restore does not undo bans or invite users back.
+                continue  
             except discord.HTTPException:
                 errors.append(f"멤버 {uid} 역할 복구 실패")
         self.remap_settings(guild.id,maps)
-        await self.log_channel(guild) # Never leave admin logs public after restore.
+        await self.log_channel(guild) 
         return "백업 복구 처리 완료. 밴·의심자 정지는 유지됩니다.\n" + ("주의: "+" / ".join(errors[:15]) if errors else "지원되는 채널·역할·멤버 역할 복구 완료.") + f"\n미지원 채널 {len(data['unsupported'])}개. 메시지·스레드·서버 자체는 복구하지 않습니다."
 
     def remap_settings(self,guild_id,maps):
-        # Only known guild-local ID columns; never rewrite user IDs or global records.
+        
         channel_columns={"meeting_settings":["meeting_channel_id","log_channel_id","notice_channel_id","reason_channel_id"],
                          "meeting_chat":["channel_id"],"raid_config":["log_channel"]}
         role_columns={"warning_settings":["role_id"],"nickname_excluded_roles":["role_id"],
@@ -430,7 +430,7 @@ class AntiRaid:
                 db.execute("UPDATE raid_suspects SET active=0 WHERE guild_id=? AND user_id=?",key)
             self.suspended.discard(key)
         except discord.HTTPException:
-            # A multi-role request may have partially succeeded: retain suspension.
+            
             try:
                 await self.quarantine(await guild.fetch_member(user_id))
             except discord.HTTPException:
