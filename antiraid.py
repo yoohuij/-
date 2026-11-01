@@ -388,6 +388,8 @@ class AntiRaid:
         role_columns={"warning_settings":["role_id"],"nickname_excluded_roles":["role_id"],
                       "donation_supporter_role":["role_id"],"donation_tiers":["role_id"],
                       "role_categories":["role_id"],
+                      "special_role_categories":["role_id"],
+                      "special_category_end":["role_id"],
                       "donation_rank_roles":["first_role","second_role","third_role"],
                       "donation_role_assignments":["role_id"],"donation_tier_assignments":["role_id"],
                       "donation_supporter_assignments":["role_id"]}
