@@ -1517,7 +1517,7 @@ async def set_role_exception(interaction: discord.Interaction, 동작: app_comma
         await interaction.response.send_message("현재 서버의 @everyone 이외 역할을 선택해 주세요.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    if adding and 역할.id in category_feature.ids(guild.id):
+    if adding and 역할.id in (category_feature.ids(guild.id) | category_feature.special.ids(guild.id)):
         await interaction.followup.send("자동 회수되는 카테고리 역할 자체는 예외 역할로 지정할 수 없습니다. 별도 역할을 선택해 주세요.", ephemeral=True)
         return
     get_exemption_roles(guild.id)
@@ -2191,6 +2191,9 @@ async def run_startup_updates():
     for guild in bot.guilds:
         category_feature.queue(guild)
         worker = category_feature.workers.get(guild.id)
+        if worker is not None:
+            await worker
+        worker = category_feature.special.workers.get(guild.id)
         if worker is not None:
             await worker
         await asyncio.sleep(5)
