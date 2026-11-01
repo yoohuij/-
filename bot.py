@@ -2014,6 +2014,11 @@ def nickname_role_prefix(role):
 
 def role_nickname(member, excluded, history, saved_prefixes=()):
     pass
+    excluded = set(excluded)
+    excluded.update(category_feature.special.ids(member.guild.id))
+    end_id = category_feature.special.end_id(member.guild.id)
+    if end_id is not None:
+        excluded.add(end_id)
     role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
     base = member.nick
     if history:
@@ -2376,7 +2381,7 @@ import donations
 donation_feature = donations.install(bot, database, is_bot_administrator)
 
 import role_categories
-category_feature = role_categories.install(bot, database, is_owner, get_notice_exemptions, get_exemption_roles)
+category_feature = role_categories.install(bot, database, is_owner, get_notice_exemptions, get_exemption_roles, queue_nickname_updates)
 
 import lawless
 lawless_feature = lawless.install(bot, database, is_owner, can_use_notice_admin)
