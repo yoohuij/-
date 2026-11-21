@@ -119,7 +119,7 @@ class MeetingChat:
                 old = await self.validate(guild, state["old_id"], settings)
                 old = await self.lock_channel(old)
                 
-                matches = [c for c in await guild.fetch_channels()
+                matches = [c for c in guild.text_channels
                            if isinstance(c, discord.TextChannel) and c.name == state["marker"]]
                 if len(matches) > 1:
                     raise ValueError("복구 대상 채널이 여러 개입니다. 소유주 확인이 필요합니다.")
