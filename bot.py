@@ -1973,6 +1973,7 @@ async def end_meeting(interaction: discord.Interaction) -> None:
 nickname_locks: dict[int, asyncio.Lock] = {}
 nickname_pending: dict[int, set[int]] = {}
 nickname_workers: dict[int, asyncio.Task] = {}
+nickname_member_snapshots = {}
 
 
 def nickname_database():
@@ -2103,38 +2104,63 @@ def nickname_auto_enabled(guild_id):
 async def run_nickname_updates(guild):
     import logging
     pending = nickname_pending.setdefault(guild.id, set())
+    snapshots = nickname_member_snapshots.setdefault(guild.id, {})
+    counts = {"변경": 0, "동일": 0, "권한·봇 제외": 0, "예외 제외": 0, "길이 초과": 0, "실패": 0}
     try:
         while pending:
             user_id = pending.pop()
             async with nickname_locks.setdefault(guild.id, asyncio.Lock()):
                 
-                member, me = guild.get_member(user_id), guild.me
-                if (member is None or me is None or member.bot or member.id in get_notice_exemptions(guild.id) or member.id == guild.owner_id
+                member = snapshots.pop(user_id, None) or guild.get_member(user_id)
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(user_id)
+                    except discord.HTTPException:
+                        counts["실패"] += 1
+                        continue
+                me = guild.me
+                if member.id in get_notice_exemptions(guild.id) or any(r.id in get_exemption_roles(guild.id) for r in member.roles):
+                    counts["예외 제외"] += 1
+                    continue
+                if (me is None or member.bot or member.id == guild.owner_id
                     or not me.guild_permissions.manage_nicknames or member.top_role >= me.top_role):
+                    counts["권한·봇 제외"] += 1
                     continue
                 with closing(nickname_database()) as db:
                     excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
                     history = db.execute("SELECT base,applied,prefix FROM nickname_history WHERE guild_id=? AND user_id=?", (guild.id, user_id)).fetchone()
                 base, target, prefix = role_nickname(member, excluded, history, saved_nickname_prefixes(guild.id,user_id))
-                if target == member.nick or (target is not None and len(target) > 32):
+                if target is not None and len(target) > 32:
+                    counts["길이 초과"] += 1
+                    continue
+                if target == member.nick:
+                    counts["동일"] += 1
                     continue
                 try:
                     await member.edit(nick=target, reason="역할 변경에 따른 자동 닉네임 갱신")
-                except discord.HTTPException:
-                    logging.getLogger(__name__).warning("자동 닉네임 변경 실패: guild=%s user=%s", guild.id, user_id)
+                except discord.HTTPException as exc:
+                    counts["실패"] += 1
+                    logging.getLogger(__name__).warning("자동 닉네임 변경 실패: guild=%s user=%s status=%s code=%s", guild.id, user_id, exc.status, exc.code)
                     continue
                 save_nickname_history(guild.id,user_id,base,target,prefix)
+                counts["변경"] += 1
             await asyncio.sleep(0.5)
     except Exception:
+        counts["실패"] += 1
         logging.getLogger(__name__).exception("자동 닉네임 작업 오류: guild=%s", guild.id)
     finally:
         nickname_workers.pop(guild.id, None)
+    return counts
 
 
 def queue_nickname_updates(guild, members):
     if not nickname_auto_enabled(guild.id):
         return
-    nickname_pending.setdefault(guild.id, set()).update(m.id for m in members if not m.bot)
+    snapshots = nickname_member_snapshots.setdefault(guild.id, {})
+    for member in members:
+        if not member.bot:
+            snapshots[member.id] = member
+            nickname_pending.setdefault(guild.id, set()).add(member.id)
     if guild.id not in nickname_workers:
         nickname_workers[guild.id] = asyncio.create_task(run_nickname_updates(guild))
 
@@ -2334,8 +2360,11 @@ async def apply_role_nicknames(interaction: discord.Interaction):
         try:
             members = await asyncio.wait_for(guild.chunk(cache=True), timeout=60)
         except (discord.HTTPException, asyncio.TimeoutError, discord.ClientException):
-            await interaction.edit_original_response(content="자동 갱신은 켰지만 전체 인원을 불러오지 못했습니다. Server Members Intent 확인 후 다시 실행해 주세요.")
-            return
+            try:
+                members = [member async for member in guild.fetch_members(limit=None)]
+            except (discord.HTTPException, discord.ClientException) as exc:
+                await interaction.edit_original_response(content=f"자동 갱신은 켰지만 인원 조회에 실패했습니다 ({type(exc).__name__}). Server Members Intent와 호스팅 로그를 확인해 주세요.")
+                return
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
             history = {r[0]: r[1:] for r in db.execute("SELECT user_id,base,applied,prefix FROM nickname_history WHERE guild_id=?", (guild.id,))}
@@ -2346,7 +2375,7 @@ async def apply_role_nicknames(interaction: discord.Interaction):
             if time.monotonic() - started > 660:
                 break
             processed += 1
-            if member.id in get_notice_exemptions(guild.id):
+            if member.id in get_notice_exemptions(guild.id) or any(r.id in get_exemption_roles(guild.id) for r in member.roles):
                 counts["예외 제외"] += 1
                 continue
             if member.bot or member.id == guild.owner_id or member.top_role >= me.top_role:
@@ -2405,6 +2434,7 @@ voice_activity_feature = voice_activity.install(bot, database, can_use_notice_ad
 
 async def reconcile_backup_settings(guild):
     problems = []
+    nickname_result = "역할 닉네임 자동 설정이 꺼져 있습니다. /역할닉설정으로 켜 주세요."
     async with donation_feature.lock:
         try:
             await donation_feature.update_rank_roles(guild.id)
@@ -2422,10 +2452,16 @@ async def reconcile_backup_settings(guild):
             worker = feature.workers.get(guild.id)
             if worker is not None:
                 await worker
-        queue_nickname_updates(guild, guild.members)
-        worker = nickname_workers.get(guild.id)
-        if worker is not None:
-            await worker
+        if nickname_auto_enabled(guild.id):
+            try:
+                members = [member async for member in guild.fetch_members(limit=None)]
+                queue_nickname_updates(guild, members)
+                worker = nickname_workers.get(guild.id)
+                if worker is not None:
+                    counts = await worker
+                    nickname_result = "닉네임: " + " / ".join(f"{key} {value}명" for key,value in counts.items())
+            except (discord.HTTPException, discord.ClientException) as exc:
+                nickname_result = f"닉네임 인원 조회 실패 ({type(exc).__name__}). /역할닉설정을 다시 실행해 주세요."
     except asyncio.CancelledError:
         workers = []
         for feature in (category_feature, category_feature.special):
@@ -2440,6 +2476,7 @@ async def reconcile_backup_settings(guild):
             worker.cancel()
             workers.append(worker)
         nickname_pending.pop(guild.id, None)
+        nickname_member_snapshots.pop(guild.id, None)
         if workers:
             await asyncio.gather(*workers, return_exceptions=True)
         raise
@@ -2455,7 +2492,7 @@ async def reconcile_backup_settings(guild):
         await voice_activity_feature.update(guild)
     except (ValueError, discord.HTTPException) as exc:
         problems.append(f"통방 활동률: {exc}")
-    return "기존 자동 기능 갱신 처리 완료." + (" 확인 필요: " + " / ".join(problems)[:700] if problems else "")
+    return "기존 자동 기능 갱신 처리 완료.\n" + nickname_result + (" 확인 필요: " + " / ".join(problems)[:700] if problems else "")
 
 
 antiraid_feature.reconcile_settings = reconcile_backup_settings
