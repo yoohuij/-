@@ -2013,13 +2013,18 @@ def nickname_role_prefix(role):
     return f"『 {name} 』 " if name else ""
 
 
-def role_nickname(member, excluded, history, saved_prefixes=()):
-    pass
+def nickname_role_exclusions(guild_id, excluded):
     excluded = set(excluded)
-    excluded.update(category_feature.special.ids(member.guild.id))
-    end_id = category_feature.special.end_id(member.guild.id)
+    excluded.update(category_feature.ids(guild_id))
+    excluded.update(category_feature.special.ids(guild_id))
+    end_id = category_feature.special.end_id(guild_id)
     if end_id is not None:
         excluded.add(end_id)
+    return excluded
+
+
+def role_nickname(member, excluded, history, saved_prefixes=()):
+    excluded = nickname_role_exclusions(member.guild.id, excluded)
     role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
     base = member.nick
     if history:
@@ -2080,6 +2085,7 @@ async def change_own_nickname(interaction: discord.Interaction, 닉네임: app_c
             return
         with closing(nickname_database()) as db:
             excluded = {r[0] for r in db.execute("SELECT role_id FROM nickname_excluded_roles WHERE guild_id=?", (guild.id,))}
+        excluded = nickname_role_exclusions(guild.id, excluded)
         role = next((r for r in reversed(member.roles) if not r.is_default() and r.id not in excluded), None)
         prefix = "" if member.id in get_notice_exemptions(guild.id) else nickname_role_prefix(role)
         target = prefix + base
