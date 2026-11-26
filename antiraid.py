@@ -244,13 +244,29 @@ class AntiRaid:
                 db.execute("UPDATE raid_incidents SET result=? WHERE id=?", (result,incident_id))
             await self.report(entry.guild,incident_id,actor,details,result)
 
+    async def backup_channels(self, guild):
+        try:
+            return await guild.fetch_channels(), []
+        except discord.InvalidData:
+            payload = await guild._state.http.get_all_guild_channels(guild.id)
+            factories = {0: discord.TextChannel, 2: discord.VoiceChannel,
+                         4: discord.CategoryChannel, 13: discord.StageChannel}
+            channels, unsupported = [], []
+            for item in payload:
+                factory = factories.get(item["type"])
+                if factory is None:
+                    unsupported.append(int(item["id"]))
+                    continue
+                channels.append(factory(guild=guild, state=guild._state, data=item))
+            return channels, unsupported
+
     async def save_backup(self, guild):
         if any(g==guild.id for g,u in self.suspended):
             raise ValueError("미해결 의심자가 있어 기존 백업을 덮어쓸 수 없습니다.")
         roles = await guild.fetch_roles()
-        channels = await guild.fetch_channels()
+        channels, unsupported = await self.backup_channels(guild)
         members = [m async for m in guild.fetch_members(limit=None)]
-        data = {"name":guild.name,"roles":[],"channels":[],"members":{},"unsupported":[]}
+        data = {"name":guild.name,"roles":[],"channels":[],"members":{},"unsupported":unsupported}
         for r in roles:
             data["roles"].append(dict(id=r.id,name=r.name,permissions=r.permissions.value,
                 colour=r.colour.value,hoist=r.hoist,mentionable=r.mentionable,position=r.position,managed=r.managed))
@@ -396,7 +412,8 @@ class AntiRaid:
             if positions: await guild.edit_role_positions(positions=positions,reason="백업 역할 순서 복구")
         except discord.HTTPException:
             errors.append("일부 역할 위치 복구 실패")
-        current_channels={c.id:c for c in await guild.fetch_channels()}
+        channels, _ = await self.backup_channels(guild)
+        current_channels={c.id:c for c in channels}
         for c in sorted(data["channels"],key=lambda c:(c["type"]!=4,c["position"])):
             cid=maps["channels"].get(str(c["id"]),c["id"])
             channel=current_channels.get(cid)
