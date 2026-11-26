@@ -1,5 +1,7 @@
 from contextlib import closing
 import re
+import json
+import base64
 
 
 CONFIG = {
@@ -22,7 +24,17 @@ CONFIG = {
     'voice_activity': {'channel_id': 'channels'},
     'meeting_deputies': {},
     'raid_config': {'log_channel': 'channels'},
+    'approved_absences': {},
 }
+
+SHARED = {'global_administrators', 'global_exemptions', 'donation_records',
+          'donation_adjustments', 'donation_corrections'}
+
+
+def archived_value(value):
+    if isinstance(value, bytes):
+        return {'base64': base64.b64encode(value).decode('ascii')}
+    return value
 
 
 def snapshot(database, guild_id):
@@ -35,6 +47,18 @@ def snapshot(database, guild_id):
             cursor = db.execute(f'SELECT * FROM {table} WHERE guild_id=?', (guild_id,))
             columns = [c[0] for c in cursor.description]
             result[table] = [dict(zip(columns, row)) for row in cursor]
+        records = {}
+        for table in sorted(tables):
+            if table.startswith('sqlite_') or table in {'raid_backups', 'server_transfer_archives'}:
+                continue
+            quoted = '"' + table.replace('"', '""') + '"'
+            columns = [r[1] for r in db.execute(f'PRAGMA table_info({quoted})')]
+            scoped = 'guild_id' in columns and table not in SHARED
+            cursor = db.execute(f'SELECT * FROM {quoted}' + (' WHERE guild_id=?' if scoped else ''),
+                                (guild_id,) if scoped else ())
+            records[table] = {'columns': columns, 'rows': [[archived_value(v) for v in row] for row in cursor],
+                              'scope': 'server' if scoped else 'shared'}
+        result['__database__'] = {'source_guild_id': guild_id, 'tables': records}
     return result
 
 
@@ -78,6 +102,11 @@ def name_maps(data, roles, channels):
 def apply(database, guild_id, settings, maps, *, moving=False):
     problems, applied = [], 0
     with closing(database()) as db, db:
+        archive = settings.get('__database__')
+        if archive:
+            db.execute('CREATE TABLE IF NOT EXISTS server_transfer_archives (guild_id INTEGER NOT NULL, source_guild_id INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(guild_id,source_guild_id))')
+            db.execute('INSERT OR REPLACE INTO server_transfer_archives VALUES (?,?,?)',
+                       (guild_id, archive['source_guild_id'], json.dumps(archive, ensure_ascii=False)))
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         for table, source in settings.items():
             if table not in CONFIG or table not in tables:
@@ -120,5 +149,6 @@ def apply(database, guild_id, settings, maps, *, moving=False):
                 names = list(row)
                 db.execute(f"INSERT INTO {table} ({','.join(names)}) VALUES ({','.join('?' for _ in names)})", list(row.values()))
             applied += 1
-    return f'설정 {applied}종 적용' + (' · 확인 필요: ' + ' / '.join(dict.fromkeys(problems))[:650] if problems else '')
+    archived = len(settings.get('__database__', {}).get('tables', {}))
+    return f'설정·명단 {applied}종 적용 · 원본 DB 기록 {archived}종 보관' + (' · 확인 필요: ' + ' / '.join(dict.fromkeys(problems))[:650] if problems else '')
 
