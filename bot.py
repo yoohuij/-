@@ -2144,6 +2144,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     await antiraid_feature.enforce(after)
     if is_suspended(after.id):
         return
+    if after.guild.id in antiraid_feature.automation_paused:
+        return
     
     if {r.id for r in before.roles} != {r.id for r in after.roles}:
         queue_nickname_updates(after.guild, [after])
@@ -2154,6 +2156,8 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def on_member_join(member: discord.Member):
     await antiraid_feature.enforce(member)
     if is_suspended(member.id):
+        return
+    if member.guild.id in antiraid_feature.automation_paused:
         return
     queue_nickname_updates(member.guild, [member])
     category_feature.queue(member.guild, member)
@@ -2169,6 +2173,8 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_guild_role_update(before: discord.Role, after: discord.Role):
     await antiraid_feature.role_changed(after)
+    if after.guild.id in antiraid_feature.automation_paused:
+        return
     category_feature.queue(after.guild)
     if before.name != after.name or before.position != after.position:
         queue_nickname_updates(after.guild, after.guild.members)
@@ -2176,6 +2182,8 @@ async def on_guild_role_update(before: discord.Role, after: discord.Role):
 
 @bot.event
 async def on_guild_role_delete(role: discord.Role):
+    if role.guild.id in antiraid_feature.automation_paused:
+        return
     category_feature.configure(role.guild.id, [role.id], False)
     category_feature.queue(role.guild)
     queue_nickname_updates(role.guild, role.guild.members)
@@ -2183,6 +2191,8 @@ async def on_guild_role_delete(role: discord.Role):
 
 @bot.event
 async def on_guild_role_create(role: discord.Role):
+    if role.guild.id in antiraid_feature.automation_paused:
+        return
     category_feature.queue(role.guild)
 
 
@@ -2393,6 +2403,64 @@ import voice_activity
 voice_activity_feature = voice_activity.install(bot, database, can_use_notice_admin)
 
 
+async def reconcile_backup_settings(guild):
+    problems = []
+    async with donation_feature.lock:
+        try:
+            await donation_feature.update_rank_roles(guild.id)
+        except (ValueError, discord.HTTPException) as exc:
+            problems.append(f"후원 역할: {exc}")
+        config = donation_feature.store.settings(guild.id)
+        if config['ranking_channel'] and config['ranking_template']:
+            try:
+                await donation_feature.update_ranking(guild.id)
+            except (ValueError, discord.HTTPException) as exc:
+                problems.append(f"후원 랭킹 메시지: {exc}")
+    category_feature.queue(guild)
+    try:
+        for feature in (category_feature, category_feature.special):
+            worker = feature.workers.get(guild.id)
+            if worker is not None:
+                await worker
+        queue_nickname_updates(guild, guild.members)
+        worker = nickname_workers.get(guild.id)
+        if worker is not None:
+            await worker
+    except asyncio.CancelledError:
+        workers = []
+        for feature in (category_feature, category_feature.special):
+            worker = feature.workers.get(guild.id)
+            if worker is not None:
+                worker.cancel()
+                workers.append(worker)
+            feature.pending.pop(guild.id, None)
+            feature.full.discard(guild.id)
+        worker = nickname_workers.get(guild.id)
+        if worker is not None:
+            worker.cancel()
+            workers.append(worker)
+        nickname_pending.pop(guild.id, None)
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+        raise
+    config = lawless_feature.settings(guild.id)
+    if config:
+        try:
+            channel = await lawless_feature.channel(guild, config['channel_id'])
+            await lawless_feature.ensure_notice(channel, guild.id, config)
+            await lawless_feature.set_writable(channel, config['is_open'])
+        except (ValueError, discord.HTTPException) as exc:
+            problems.append(f"무법지대 공지: {exc}")
+    try:
+        await voice_activity_feature.update(guild)
+    except (ValueError, discord.HTTPException) as exc:
+        problems.append(f"통방 활동률: {exc}")
+    return "기존 자동 기능 갱신 처리 완료." + (" 확인 필요: " + " / ".join(problems)[:700] if problems else "")
+
+
+antiraid_feature.reconcile_settings = reconcile_backup_settings
+
+
 for command in bot.tree.walk_commands():
     command.description = '·'
     if isinstance(command, app_commands.Command):
@@ -2414,3 +2482,4 @@ if __name__ == "__main__":
         asyncio.run(run_bot(token))
     except KeyboardInterrupt:
         pass
+
