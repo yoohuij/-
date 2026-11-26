@@ -6,6 +6,7 @@ import time
 from contextlib import closing
 import discord
 from discord import app_commands
+import backup_settings
 
 LOG = logging.getLogger(__name__)
 WINDOW = 10
@@ -30,6 +31,9 @@ class AntiRaid:
         self.bot, self.database, self.owner_check = bot, database, owner_check
         self.locks, self.actor_locks, self.log_locks = {}, {}, {}
         self.resolving = set()
+        self.jobs = {}
+        self.automation_paused = set()
+        self.reconcile_settings = None
         with closing(database()) as db, db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS raid_backups(guild_id INTEGER PRIMARY KEY, saved REAL NOT NULL, data TEXT NOT NULL, maps TEXT NOT NULL);
@@ -42,6 +46,46 @@ class AntiRaid:
 
     def blocked(self, user_id):
         return any(u == user_id for _,u in self.suspended)
+
+    async def run_operation(self, interaction, title, work):
+        guild_id = interaction.guild.id
+        lock = self.lock(guild_id)
+        if lock.locked():
+            await interaction.followup.send("저장·복구·서버이전 처리 중입니다.", ephemeral=True)
+            return
+        async with lock:
+            view = OperationView(self, interaction.user.id, guild_id)
+            message = await interaction.followup.send(f"{title} 진행 중입니다.", view=view, ephemeral=True, wait=True)
+            async def progress(text):
+                await message.edit(content=text[:1900], view=view, allowed_mentions=discord.AllowedMentions.none())
+            async def execute():
+                async with asyncio.timeout(720):
+                    return await work(progress)
+            task = asyncio.create_task(execute())
+            view.task = task
+            self.jobs[guild_id] = task
+            if title != "저장":
+                self.automation_paused.add(guild_id)
+            try:
+                result = await task
+                text = f"최종종료 · {title} 처리가 완료되었습니다.\n{result}"
+            except asyncio.CancelledError:
+                if not view.cancel_requested:
+                    raise
+                text = f"{title} 작업을 중단했습니다. 이미 반영된 변경은 유지됩니다. 다시 실행할 수 있습니다."
+            except Exception as exc:
+                LOG.exception("%s 처리 실패", title)
+                text = f"{title} 중단: {type(exc).__name__}: {exc}\n일부 변경은 반영됐을 수 있습니다. 확인 후 다시 실행해 주세요."
+            finally:
+                self.jobs.pop(guild_id, None)
+                self.automation_paused.discard(guild_id)
+                view.stop()
+            await message.edit(content=text[:1950], view=None, allowed_mentions=discord.AllowedMentions.none())
+
+    async def refresh_settings(self, guild):
+        if self.reconcile_settings is None:
+            return ""
+        return await self.reconcile_settings(guild)
 
     def automatic_role_allowed(self, user_id, role):
         return not self.blocked(user_id) or (role is not None and not dangerous(role))
@@ -266,7 +310,10 @@ class AntiRaid:
         roles = await guild.fetch_roles()
         channels, unsupported = await self.backup_channels(guild)
         members = [m async for m in guild.fetch_members(limit=None)]
-        data = {"name":guild.name,"roles":[],"channels":[],"members":{},"unsupported":unsupported}
+        settings = backup_settings.snapshot(self.database, guild.id)
+        automatic = backup_settings.automatic_roles(settings)
+        data = {"name":guild.name,"roles":[],"channels":[],"members":{},"unsupported":unsupported,
+                "settings": settings, "automatic_roles": sorted(automatic)}
         for r in roles:
             data["roles"].append(dict(id=r.id,name=r.name,permissions=r.permissions.value,
                 colour=r.colour.value,hoist=r.hoist,mentionable=r.mentionable,position=r.position,managed=r.managed))
@@ -285,10 +332,10 @@ class AntiRaid:
                 item.update(bitrate=c.bitrate,user_limit=c.user_limit,rtc_region=c.rtc_region)
             data["channels"].append(item)
         for member in members:
-            data["members"][str(member.id)] = [r.id for r in member.roles if not r.is_default() and not r.managed]
+            data["members"][str(member.id)] = [r.id for r in member.roles if not r.is_default() and not r.managed and r.id not in automatic]
         with closing(self.database()) as db, db:
             db.execute("INSERT OR REPLACE INTO raid_backups VALUES (?,?,?,?)",(guild.id,time.time(),json.dumps(data),json.dumps({"roles":{},"channels":{}})))
-        return f"역할 {len(roles)}개, 채널 {len(data['channels'])}개, 멤버 {len(members)}명 저장. 포럼·미디어·공지 채널 등 복구 미지원 {len(data['unsupported'])}개."
+        return f"역할 {len(roles)}개, 채널 {len(data['channels'])}개, 멤버 {len(members)}명, 설정·양식 {len(settings)}종 저장. 자동 역할 {len(automatic)}개는 유저별 역할 기록에서 제외했습니다. 포럼·미디어·공지 채널 등 복구 미지원 {len(data['unsupported'])}개."
 
     def save_maps(self,guild_id,maps):
         with closing(self.database()) as db, db:
@@ -299,11 +346,12 @@ class AntiRaid:
             row = db.execute("SELECT guild_id,saved,data FROM raid_backups ORDER BY saved DESC,guild_id DESC LIMIT 1").fetchone()
         return (row[0], row[1], json.loads(row[2])) if row else None
 
-    async def transfer_roles(self, guild, source_id, data):
+    async def transfer_roles(self, guild, source_id, data, progress=None):
         if not guild.me.guild_permissions.manage_roles:
             raise ValueError("봇에 역할 관리 권한이 필요합니다.")
         targets, sources = {}, {}
-        for role in await guild.fetch_roles():
+        current_roles = await guild.fetch_roles()
+        for role in current_roles:
             targets.setdefault(role.name, []).append(role)
         for role in data["roles"]:
             sources.setdefault(role["name"], []).append(role)
@@ -320,13 +368,30 @@ class AntiRaid:
                 skipped.append(role["name"])
                 continue
             mapping[role["id"]] = target
+        settings = data.get("settings", {})
+        automatic = set(data.get("automatic_roles", [])) | backup_settings.automatic_roles(settings)
+        if not settings:
+            automatic |= backup_settings.automatic_roles(backup_settings.snapshot(self.database, source_id))
+        if progress:
+            await progress(f"역할 확인 완료: 연결 {len(mapping)}개 / 제외 {len(skipped)}개\n"
+                           + ("제외: " + ", ".join(skipped)[:600] + "\n" if skipped else "")
+                           + "설정·메시지 양식을 연결한 뒤 유저별 역할 부여를 시작합니다.")
+        settings_result = "이전 저장본에 설정·양식이 없습니다. 원본 서버에서 /저장을 다시 실행해 주세요."
+        if "settings" in data:
+            channels, _ = await self.backup_channels(guild)
+            maps = backup_settings.name_maps(data, current_roles, channels)
+            settings_result = backup_settings.apply(self.database, guild.id, settings, maps, moving=source_id != guild.id)
+        automatic |= backup_settings.automatic_roles(backup_settings.snapshot(self.database, guild.id))
         changed = added = absent = blocked = failed = unchanged = 0
-        for uid, role_ids in data["members"].items():
+        for index, (uid, role_ids) in enumerate(data["members"].items()):
+            if progress and index % 20 == 0:
+                await progress(f"역할 연결 {len(mapping)}개 / 제외 {len(skipped)}개\n유저별 역할 부여 중: {index}/{len(data['members'])}명 · 추가 {added}건\n{settings_result}")
             uid = int(uid)
             if self.blocked(uid):
                 blocked += 1
                 continue
-            desired = {mapping[rid].id: mapping[rid] for rid in role_ids if rid in mapping}
+            desired = {mapping[rid].id: mapping[rid] for rid in role_ids
+                       if rid in mapping and rid not in automatic and mapping[rid].id not in automatic}
             if not desired:
                 unchanged += 1
                 continue
@@ -355,17 +420,21 @@ class AntiRaid:
                     failed += 1
             changed += bool(success)
             added += success
+        if progress:
+            await progress(f"유저별 역할 부여 완료: {changed}명 · {added}건\n후원·카테고리·닉네임 자동 기능 갱신 중입니다.")
+        refresh_result = await self.refresh_settings(guild)
         return (f"역할 이전 완료: {changed}명에게 역할 {added}건 추가\n"
                 f"추가 대상 없음 {unchanged}명 · 서버에 없음 {absent}명 · 의심자 제외 {blocked}명 · 요청 실패 {failed}건\n"
                 f"연결된 역할 {len(mapping)}개 · 이름 중복·누락·권한으로 제외 {len(skipped)}개\n"
                 + ("제외 역할: " + ", ".join(skipped)[:600] if skipped else "")
-                + "\n기존 역할과 저장본은 유지됩니다.")
+                + f"\n{settings_result}\n{refresh_result}\n기존 일반 역할과 저장본은 유지됩니다.")
 
-    async def restore(self,guild):
+    async def restore(self,guild,progress=None):
         backup = self.backup(guild.id)
         if not backup:
             raise ValueError("먼저 소유주가 /저장으로 백업해야 합니다.")
         _,data,maps=backup
+        automatic = set(data.get("automatic_roles", [])) | backup_settings.automatic_roles(data.get("settings", backup_settings.snapshot(self.database, guild.id)))
         errors=[]
         try:
             await guild.edit(name=data["name"],reason="저장된 서버 이름 복구")
@@ -414,6 +483,8 @@ class AntiRaid:
             errors.append("일부 역할 위치 복구 실패")
         channels, _ = await self.backup_channels(guild)
         current_channels={c.id:c for c in channels}
+        if progress:
+            await progress(f"역할 복구 확인 완료: 현재 {len(current_roles)}개\n채널과 기본 설정 연결을 복구하고 있습니다.")
         for c in sorted(data["channels"],key=lambda c:(c["type"]!=4,c["position"])):
             cid=maps["channels"].get(str(c["id"]),c["id"])
             channel=current_channels.get(cid)
@@ -448,13 +519,17 @@ class AntiRaid:
             except discord.HTTPException:
                 errors.append(f"채널 {c['name']} 복구 실패")
         
-        for uid,role_ids in data["members"].items():
+        if progress:
+            await progress("역할·채널 복구 단계 완료. 유저별 일반 역할을 부여합니다.")
+        for index, (uid,role_ids) in enumerate(data["members"].items()):
+            if progress and index % 20 == 0:
+                await progress(f"유저별 역할 복구 중: {index}/{len(data['members'])}명 처리\n자동 역할은 기존 기능으로 다시 계산합니다.")
             if self.blocked(int(uid)):
                 continue  
             try:
                 member=await guild.fetch_member(int(uid))
                 desired=[current_roles[maps["roles"].get(str(rid),rid)] for rid in role_ids
-                         if maps["roles"].get(str(rid),rid) in current_roles]
+                         if rid not in automatic and maps["roles"].get(str(rid),rid) in current_roles]
                 desired=[r for r in desired if r not in member.roles and not r.managed and r < guild.me.top_role]
                 if desired: await member.add_roles(*desired,reason="백업 멤버 역할 복구")
             except discord.NotFound:
@@ -462,8 +537,19 @@ class AntiRaid:
             except discord.HTTPException:
                 errors.append(f"멤버 {uid} 역할 복구 실패")
         self.remap_settings(guild.id,maps)
+        settings_result = "이전 저장본에 기본 설정이 없어 현재 설정을 유지했습니다."
+        if "settings" in data:
+            complete_maps = {
+                "roles": {str(r["id"]): maps["roles"].get(str(r["id"]),r["id"]) for r in data["roles"]
+                          if maps["roles"].get(str(r["id"]),r["id"]) in current_roles},
+                "channels": {str(c["id"]): maps["channels"].get(str(c["id"]),c["id"]) for c in data["channels"]
+                             if maps["channels"].get(str(c["id"]),c["id"]) in current_channels}}
+            settings_result = backup_settings.apply(self.database, guild.id, data["settings"], complete_maps)
+        if progress:
+            await progress("유저별 역할 복구 완료. 후원·카테고리·닉네임 자동 기능 갱신 중입니다.")
+        refresh_result = await self.refresh_settings(guild)
         await self.log_channel(guild) 
-        return "백업 복구 처리 완료. 밴·의심자 정지는 유지됩니다.\n" + ("주의: "+" / ".join(errors[:15]) if errors else "지원되는 채널·역할·멤버 역할 복구 완료.") + f"\n미지원 채널 {len(data['unsupported'])}개. 메시지·스레드·서버 자체는 복구하지 않습니다."
+        return "백업 복구 처리 완료. 밴·의심자 정지는 유지됩니다.\n" + ("주의: "+" / ".join(errors[:15]) if errors else "지원되는 채널·역할·멤버 역할 복구 완료.") + f"\n{settings_result}\n{refresh_result}\n미지원 채널 {len(data['unsupported'])}개. 과거 대화·스레드·서버 자체는 복구하지 않습니다."
 
     def remap_settings(self,guild_id,maps):
         
@@ -527,6 +613,26 @@ class AntiRaid:
         await self.log_channel(guild)
         return "의심자 정지를 해제하고 저장된 역할을 복원했습니다. 기존 봇 관리자 등록을 다시 사용할 수 있습니다."
 
+class OperationView(discord.ui.View):
+    def __init__(self, feature, user_id, guild_id):
+        super().__init__(timeout=800)
+        self.feature, self.user_id, self.guild_id = feature, user_id, guild_id
+        self.task = None
+        self.cancel_requested = False
+
+    @discord.ui.button(label="중단", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction, button):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.user.id != self.user_id or interaction.guild_id != self.guild_id:
+            await interaction.followup.send("작업을 시작한 사람만 중단할 수 있습니다.", ephemeral=True)
+            return
+        if self.task is None or self.task.done():
+            await interaction.followup.send("이미 종료된 작업입니다.", ephemeral=True)
+            return
+        self.cancel_requested = True
+        self.task.cancel()
+        await interaction.followup.send("중단을 요청했습니다. 이미 처리된 변경은 유지됩니다.", ephemeral=True)
+
 class TransferRolesView(discord.ui.View):
     def __init__(self, feature, user_id, guild_id, snapshot):
         super().__init__(timeout=120)
@@ -548,15 +654,9 @@ class TransferRolesView(discord.ui.View):
             return
         self.started = True
         button.disabled = True
-        async with lock:
-            await interaction.edit_original_response(view=self)
-            try:
-                async with asyncio.timeout(720):
-                    result = await self.feature.transfer_roles(interaction.guild, self.snapshot[0], self.snapshot[2])
-            except (ValueError, discord.HTTPException, asyncio.TimeoutError) as exc:
-                LOG.exception("서버 이전 역할 부여 실패")
-                result = f"이전 중단 ({type(exc).__name__}): 일부 역할은 이미 부여됐을 수 있습니다. 권한 확인 후 /서버이전으로 재시도하세요."
-            await interaction.followup.send(result, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        await interaction.edit_original_response(view=self)
+        await self.feature.run_operation(interaction, "서버이전", lambda progress:
+            self.feature.transfer_roles(interaction.guild, self.snapshot[0], self.snapshot[2], progress))
         self.stop()
 
 class RecoveryView(discord.ui.View):
@@ -592,16 +692,13 @@ class ConfirmRestore(discord.ui.View):
         lock=self.feature.lock(interaction.guild.id)
         if lock.locked():
             await interaction.followup.send("저장·복구 처리 중입니다.",ephemeral=True); return
-        async with lock:
-            try:
-                async with asyncio.timeout(720):
-                    result=await self.feature.restore(interaction.guild)
-            except (ValueError,discord.HTTPException,asyncio.TimeoutError) as exc:
-                LOG.exception("백업 복구 실패")
-                result=f"복구가 일부만 반영됐을 수 있습니다 ({type(exc).__name__}). 권한 확인 후 /복구로 재시도하세요."
-            button.disabled=True
-            await interaction.edit_original_response(view=self)
-            await interaction.followup.send(result,ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+        if button.disabled:
+            await interaction.followup.send("이미 시작한 작업입니다.", ephemeral=True)
+            return
+        button.disabled=True
+        await interaction.edit_original_response(view=self)
+        await self.feature.run_operation(interaction, "복구", lambda progress: self.feature.restore(interaction.guild, progress))
+        self.stop()
 
 def install(bot,database,owner_check):
     feature=AntiRaid(bot,database,owner_check)
@@ -625,21 +722,15 @@ def install(bot,database,owner_check):
         await interaction.response.defer(ephemeral=True)
         if not owner_check(interaction):
             await interaction.followup.send("소유주만 저장할 수 있습니다.",ephemeral=True); return
-        lock=feature.lock(interaction.guild.id)
-        if lock.locked():
-            await interaction.followup.send("저장·복구 처리 중입니다.",ephemeral=True); return
-        async with lock:
-            try:
-                perms=interaction.guild.me.guild_permissions
-                if not all((perms.view_audit_log,perms.manage_roles,perms.manage_channels,perms.ban_members)):
-                    raise ValueError("봇에 감사 로그 보기·역할 관리·채널 관리·멤버 차단 권한이 필요합니다.")
-                async with asyncio.timeout(720):
-                    channel=await feature.log_channel(interaction.guild)
-                    result=await feature.save_backup(interaction.guild)
-                result+=f"\n감지 활성화: 10초 내 삭제 3개 또는 역할 제거 5명. 기록방: {channel.mention}"
-            except (ValueError,discord.HTTPException,asyncio.TimeoutError) as exc:
-                result=f"저장 실패: {exc}"
-            await interaction.followup.send(result[:1900],ephemeral=True,allowed_mentions=discord.AllowedMentions.none())
+        async def work(progress):
+            perms=interaction.guild.me.guild_permissions
+            if not all((perms.view_audit_log,perms.manage_roles,perms.manage_channels,perms.ban_members)):
+                raise ValueError("봇에 감사 로그 보기·역할 관리·채널 관리·멤버 차단 권한이 필요합니다.")
+            channel=await feature.log_channel(interaction.guild)
+            await progress("역할·채널·유저별 역할 및 기본 설정·메시지 양식 저장 중입니다.")
+            result=await feature.save_backup(interaction.guild)
+            return result+f"\n감지 활성화: 10초 내 삭제 3개 또는 역할 제거 5명. 기록방: {channel.mention}"
+        await feature.run_operation(interaction, "저장", work)
 
     @bot.tree.command(name="서버이전",description="최근 저장본을 확인하고 현재 서버의 같은 이름 역할을 부여합니다.")
     @app_commands.guild_only()
@@ -658,7 +749,7 @@ def install(bot,database,owner_check):
         embed.add_field(name="이전 대상 서버", value=interaction.guild.name, inline=False)
         embed.add_field(name="저장 시각", value=f"<t:{int(saved)}:F>", inline=False)
         embed.add_field(name="저장된 역할 / 유저", value=f"{len(data['roles'])}개 / {len(data['members'])}명", inline=False)
-        embed.description = "가장 최근 /저장 기록입니다. 유저 ID와 정확히 같은 역할 이름으로 연결합니다. 중복·없는 역할·봇이 부여할 수 없는 역할과 의심자는 제외합니다. 기존 역할·닉네임·채널·원본 저장본은 직접 변경하지 않습니다. 역할 변경에 따른 기존 자동 닉변은 작동할 수 있습니다."
+        embed.description = "가장 최근 /저장 기록입니다. 같은 이름의 역할·채널로 기본 설정과 후원 메시지 양식을 연결한 뒤 유저별 일반 역할을 추가합니다. 카테고리·후원 역할·닉네임은 기존 자동 기능으로 갱신합니다. 중복·누락·부여 불가 역할과 의심자는 제외하며 원본 저장본은 유지됩니다."
         await interaction.followup.send(embed=embed, view=TransferRolesView(feature, interaction.user.id, interaction.guild.id, snapshot),
                                         ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
