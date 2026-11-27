@@ -7,6 +7,7 @@ from contextlib import closing
 import discord
 from discord import app_commands
 import backup_settings
+import server_compare
 
 LOG = logging.getLogger(__name__)
 WINDOW = 10
@@ -66,9 +67,13 @@ class AntiRaid:
             self.jobs[guild_id] = task
             if title != "저장":
                 self.automation_paused.add(guild_id)
+            completed_view = None
             try:
                 result = await task
                 text = f"최종종료 · {title} 처리가 완료되었습니다.\n{result}"
+                if isinstance(result, server_compare.TransferResult):
+                    completed_view = server_compare.MissingMembersView(interaction.user.id, result.missing,
+                        "서버이전 미입장자", lambda i: i.user.id == self.bot.application_owner_id and not self.blocked(i.user.id))
             except asyncio.CancelledError:
                 if not view.cancel_requested:
                     raise
@@ -80,7 +85,8 @@ class AntiRaid:
                 self.jobs.pop(guild_id, None)
                 self.automation_paused.discard(guild_id)
                 view.stop()
-            await message.edit(content=text[:1950], view=None, allowed_mentions=discord.AllowedMentions.none())
+            extras = {"embed": completed_view.embed(), "attachments": [completed_view.file()]} if completed_view else {}
+            await message.edit(content=text[:1950], view=completed_view, allowed_mentions=discord.AllowedMentions.none(), **extras)
 
     async def refresh_settings(self, guild):
         if self.reconcile_settings is None:
@@ -313,7 +319,7 @@ class AntiRaid:
         settings = backup_settings.snapshot(self.database, guild.id)
         automatic = backup_settings.automatic_roles(settings)
         data = {"name":guild.name,"roles":[],"channels":[],"members":{},"unsupported":unsupported,
-                "settings": settings, "automatic_roles": sorted(automatic)}
+                "settings": settings, "automatic_roles": sorted(automatic), "member_names": {}}
         for r in roles:
             data["roles"].append(dict(id=r.id,name=r.name,permissions=r.permissions.value,
                 colour=r.colour.value,hoist=r.hoist,mentionable=r.mentionable,position=r.position,managed=r.managed))
@@ -332,6 +338,7 @@ class AntiRaid:
                 item.update(bitrate=c.bitrate,user_limit=c.user_limit,rtc_region=c.rtc_region)
             data["channels"].append(item)
         for member in members:
+            data["member_names"][str(member.id)] = getattr(member, "display_name", str(member.id))
             data["members"][str(member.id)] = [r.id for r in member.roles if not r.is_default() and not r.managed and r.id not in automatic]
         with closing(self.database()) as db, db:
             db.execute("INSERT OR REPLACE INTO raid_backups VALUES (?,?,?,?)",(guild.id,time.time(),json.dumps(data),json.dumps({"roles":{},"channels":{}})))
@@ -383,6 +390,7 @@ class AntiRaid:
             settings_result = backup_settings.apply(self.database, guild.id, settings, maps, moving=source_id != guild.id)
         automatic |= backup_settings.automatic_roles(backup_settings.snapshot(self.database, guild.id))
         changed = added = absent = blocked = failed = unchanged = 0
+        missing = []
         for index, (uid, role_ids) in enumerate(data["members"].items()):
             if progress and index % 20 == 0:
                 await progress(f"역할 연결 {len(mapping)}개 / 제외 {len(skipped)}개\n유저별 역할 부여 중: {index}/{len(data['members'])}명 · 추가 {added}건\n{settings_result}")
@@ -390,19 +398,17 @@ class AntiRaid:
             if self.blocked(uid):
                 blocked += 1
                 continue
-            desired = {mapping[rid].id: mapping[rid] for rid in role_ids
-                       if rid in mapping and rid not in automatic and mapping[rid].id not in automatic}
-            if not desired:
-                unchanged += 1
-                continue
             try:
                 member = await guild.fetch_member(uid)
             except discord.NotFound:
                 absent += 1
+                missing.append((uid, data.get("member_names", {}).get(str(uid), str(uid))))
                 continue
             except discord.HTTPException:
                 failed += 1
                 continue
+            desired = {mapping[rid].id: mapping[rid] for rid in role_ids
+                       if rid in mapping and rid not in automatic and mapping[rid].id not in automatic}
             held = {role.id for role in member.roles}
             pending = [role for rid, role in desired.items() if rid not in held]
             if not pending:
@@ -423,11 +429,11 @@ class AntiRaid:
         if progress:
             await progress(f"유저별 역할 부여 완료: {changed}명 · {added}건\n후원·카테고리·닉네임 자동 기능 갱신 중입니다.")
         refresh_result = await self.refresh_settings(guild)
-        return (f"역할 이전 완료: {changed}명에게 역할 {added}건 추가\n"
+        return server_compare.TransferResult(f"역할 이전 완료: {changed}명에게 역할 {added}건 추가\n"
                 f"추가 대상 없음 {unchanged}명 · 서버에 없음 {absent}명 · 의심자 제외 {blocked}명 · 요청 실패 {failed}건\n"
                 f"연결된 역할 {len(mapping)}개 · 이름 중복·누락·권한으로 제외 {len(skipped)}개\n"
                 + ("제외 역할: " + ", ".join(skipped)[:600] if skipped else "")
-                + f"\n{settings_result}\n{refresh_result}\n기존 일반 역할과 저장본은 유지됩니다.")
+                + f"\n{settings_result}\n{refresh_result}\n기존 일반 역할과 저장본은 유지됩니다.", missing)
 
     async def restore(self,guild,progress=None):
         backup = self.backup(guild.id)
@@ -703,6 +709,7 @@ class ConfirmRestore(discord.ui.View):
 def install(bot,database,owner_check):
     feature=AntiRaid(bot,database,owner_check)
     bot.antiraid_feature=feature
+    server_compare.register(bot, feature)
     previous=bot.tree.interaction_check
     async def command_check(interaction):
         if feature.blocked(interaction.user.id):
